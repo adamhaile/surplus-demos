@@ -1,0 +1,50 @@
+<!doctype html>
+<title>Minimalist TodoMVC App in S.js</title>
+<script type="text/javascript-htmlliterals">
+    var // define our ToDo class ...
+        ToDo = opts => ({
+            title: S.data(opts.title || ''),
+            done: S.data(opts.done || false)
+        }),
+        // ... and our collection of ToDos
+        todos = S.array([]),
+        // define our viewmodel: you can filter, add and remove ToDos
+        vm = {
+            filter: S.data(null), // null=all, true=done, false=pending
+            filtered: todos.filter(t => vm.filter() === null
+                                     || vm.filter() === t.done()),
+            newTitle: S.data(""),
+            add: () => {
+                todos.unshift(ToDo({ title: vm.newTitle() }));
+                vm.newTitle("");
+            },
+            remove: todo => todos.remove(todo)
+        },
+        // finally, define our view, using HtmlLiterals
+        view =
+            <h3>Minimalist TodoMVC App in S.js</h3>
+            <input type="text" @data:keyup = vm.newTitle
+                @onkey:enter => vm.add()
+                @onkey:esc => vm.newTitle('')/>
+            <a onclick => vm.add()>+</a>
+            @vm.filtered.map(todo =>
+                <div>
+                    <input type="checkbox" @data = todo.done />
+                    <input type="text" @data = todo.title />
+                    <a onclick => vm.remove(todo)>&times;</a>
+                </div>)()
+            <div>
+                show <a onclick => vm.filter(null)>all</a>
+                | <a onclick => vm.filter(true)>done</a>
+                | <a onclick => vm.filter(false)>pending</a>
+            </div>;
+
+    // load stored todos, and create a formula to update storage
+    if (localStorage.todos)
+        todos(JSON.parse(localStorage.todos).map(ToDo));
+    S(() => localStorage.todos = JSON.stringify(todos()));
+
+    // add our view to the page
+    document.body.appendChild(view);
+</script>
+<script src="../dist/surplus.js"></script>

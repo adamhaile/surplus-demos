@@ -1,0 +1,76 @@
+<!doctype html>
+<html>
+<head>
+    <style>
+        table, h2, h5 {
+            margin: 40px auto;
+            text-align: center;
+            font-family: Helvetica;
+        }
+        td {
+            width: 30px;
+            height: 30px;
+            border: 1px solid black;
+            font-size: 29px;
+        }
+        td.open {
+            cursor: pointer;
+        }
+    </style>
+</html>
+<body>
+    <script type="text/javascript-htmlliterals">
+        var X = 'X',
+            O = 'O',
+            range = size => Array.apply(0, Array(size)).map((_, i) => i), // [0 .. size - 1]
+            Game = (size, goal) => {
+                var dim    = range(size),
+                    win    = range(goal),
+                    zs     = range(size - goal + 1),
+                    board  = dim.map(x => dim.map(y => S.data(null))),
+                    turn   = S.data(X),
+                    winner = S(() =>
+                                [X, O].find(player =>
+                                    zs.some(z =>
+                                           dim.some(x => win.every(y => board[x][y + z]() === player))
+                                        || dim.some(y => win.every(x => board[x + z][y]() === player))
+                                        || zs.some(w =>
+                                               win.every(d => board[d + z][d + w]() === player)
+                                            || win.every(d => board[d + z][size - d - w - 1]() === player))))),
+                    over   = S(() => winner() || dim.every(x => dim.every(y => board[x][y]())));
+
+                return {
+                    board : board,
+                    goal  : goal,
+                    turn  : turn,
+                    winner: winner,
+                    over  : over,
+                    move  : (x, y) => {
+                        if (winner() || board[x][y]()) return;
+                        board[x][y](turn());
+                        if (!winner()) turn(turn() === X ? O : X);
+                    }
+                };
+            },
+            View = game =>
+                <h2>Tic-Tac-Toe</h2>
+                <table>
+                    <tbody>@game.board.map((row, x) =>
+                        <tr>@row.map((cell, y) =>
+                            <td @class:open = !cell() onclick => game.move(x, y)>
+                                @cell()
+                            </td>
+                        )</tr>
+                    )</tbody>
+                </table>
+                <h5>@game.goal-in-a-row to win</h5>
+                <h5 hidden = game.over()>Turn: @game.turn()</h5>
+                <h5 hidden = !game.over()>@(game.winner() ? game.winner() + " wins!" : "draw")</h5>
+            game = Game(6, 4),
+            view = View(game);
+
+            document.body.appendChild(view);
+    </script>
+    <script type="text/javascript" src="../surplus/dist/surplus.js"></script>
+</body>
+<html>

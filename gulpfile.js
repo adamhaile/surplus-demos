@@ -5,6 +5,7 @@ var gulp = require('gulp'),
 
 var srcs = [
         "../S/dist/S.js",
+        "../S-array/src/S.array.js",
         "../htmlliterals-preprocessor/dist/htmlliterals-preprocessor.js",
         "../htmlliterals-runtime/dist/htmlliterals-runtime.js",
         "../S-htmlliterals/src/S-htmlliterals.js",
@@ -12,8 +13,10 @@ var srcs = [
     ],
     runtime = [
         "../S/dist/S.js",
+        "../S-array/src/S.array.js",
         "../htmlliterals-runtime/dist/htmlliterals-runtime.js",
-        "../S-htmlliterals/src/S-htmlliterals.js"
+        "../S-htmlliterals/src/S-htmlliterals.js",
+        "src/bootstrap.js"
     ];
 
 gulp.task('dist', function() {
