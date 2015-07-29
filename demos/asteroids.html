@@ -28,15 +28,15 @@
     <script type="text/javascript">
 
         function World(width, height) {
-            var w = this,
-                fps      = 60;
+            var w    = this,
+                _t   = 0;
 
-            this.t       = S.data(0);
-            this.dt      = S.data(1 / fps);
-            this.things  = S.array([]);
-            this.width   = S.data(width);
-            this.height  = S.data(height);
-            this.running = S.data(false);
+            w.dt      = S.data(1 / 60);
+            w.t       = S(function () { return _t += w.dt(); });
+            w.things  = S.array([]);
+            w.width   = S.data(width);
+            w.height  = S.data(height);
+            w.running = S.data(false);
 
             var frame = S.data(0),
                 frameTicker = function (t) { frame(t); requestAnimationFrame(frameTicker); };
@@ -44,27 +44,15 @@
 
             // runner
             var prior = 0;
-            S.on([frame, this.running]).S(function () {
+            S.on(frame, this.running).S(function () {
                 if (!w.running()) return;
                 if (prior) w.dt((frame() - prior) / 1000);
                 prior = frame();
             });
 
-            this.fps = S(function () { return 1 / w.dt(); });
+            w.fps = S(function () { return 1 / w.dt(); });
 
-            // t += dt
-            S(function () { w.t(w.t() + w.dt()); });
-
-            // wrap around edges
-            //this.things.map(function (o) {
-            //    var x = o.x(), y = o.y();
-            //    if (x < 0)      o.x(x % width + width);
-            //    if (x > width)  o.x(x % width);
-            //    if (y < 0)      o.y(y % height + height);
-            //    if (y > height) o.y(y % height);
-            //});
-
-            S.on(this.dt).S(function () {
+            w.position = S.on(this.dt).S(function () {
                 var things = w.things(),
                     dt = w.dt(),
                     i, thing, x, y;
@@ -84,24 +72,42 @@
                 }
             })
 
-            this.makeCollisionSignal = function (X, Y) {
+            w.makeCollisionSignal = function (X, Y) {
                 var hitter = S.data(undefined),
                     hittee = S.data(undefined),
-                    hitters = w.things.debounce(0).filter(function (t) { return t instanceof X; }),
-                    hittees = w.things.debounce(0).filter(function (t) { return t instanceof Y; });
+                    hitters = w.things.gate(S.debounce(0)).filter(function (t) { return t instanceof X; }),
+                    hittees = w.things.gate(S.debounce(0)).filter(function (t) { return t instanceof Y; });
 
                 hitter.hittee = hittee;
 
-                S.on(this.dt).defer().S(function () {
-                    var xs = hitters(),
+                S.on(w.position).S(function () {
+                    var xs = hitters().slice(),
                         ys = hittees(),
-                        x, y, i, j;
-                    for (i = 0; i < xs.length; i++) {
+                        xlen = xs.length,
+                        ylen = ys.length,
+                        yys = new Array(ylen),
+                        yxs = new Array(ylen),
+                        yrs = new Array(ylen),
+                        x, y, i, j, xx, xy, xr, yx, yy, yr;
+
+                    for (j = 0; j < ylen; j++) {
+                        y = ys[j];
+                        yxs[j] = y.x();
+                        yys[j] = y.y();
+                        yrs[j] = y.radius();
+                    }
+
+                    for (i = 0; i < xlen; i++) {
                         x = xs[i];
-                        for (j = 0; j < ys.length; j++) {
-                            y = ys[j];
-                            if (dist(x, y) < x.radius() + y.radius()) {
-                                hittee(y);
+                        xx = x.x();
+                        xy = x.y();
+                        xr = x.radius();
+                        for (j = 0; j < ylen; j++) {
+                            yx = yxs[j];
+                            yy = yys[j];
+                            yr = yrs[j];
+                            if (dist(xx, xy, yx, yy) < xr + yr) {
+                                hittee(ys[j]);
                                 hitter(x);
                             }
                         }
@@ -169,13 +175,18 @@
                 var self = this,
                     args = [].slice.call(arguments);
                 args.push(function () { f.dispose(); });
-                var f = S.once().S(function () { return fn.apply(self, args); });
-                return f() === undefined ? this : f();
+                var f = S.on().S(function () {
+                    var o = fn.apply(self, args);
+                    return o === undefined ? self : o;
+                });
+                return f();
             }
         }
 
-        function dist(a, b) {
-            return Math.sqrt(Math.pow(a.x() - b.x(), 2) + Math.pow(a.y() - b.y(), 2));
+        function dist(ax, ay, bx, by) {
+            var dx = ax - bx,
+                dy = ay - by;
+            return Math.sqrt(dx * dx + dy * dy);
         }
     </script>
     <script type="text/javascript-htmlliterals">
@@ -189,8 +200,12 @@
 
                 this.player = S.data(new Player(this));
 
+                new Asteroid(this, 40);
+                new Asteroid(this, 40);
+                new Asteroid(this, 40);
+
                 this.lose = S(function () { return g.ships() === 0; });
-                this.win = S.defer().S(function () { return !g.things().some(function (t) { return t instanceof Asteroid; }); });
+                this.win = S.gate(S.debounce(0)).S(function () { return !g.things().some(function (t) { return t instanceof Asteroid; }); });
                 this.over = S(function () { return g.win() || g.lose(); });
                 this.paused = S(function () { return !g.over() && !g.running(); });
 
@@ -202,7 +217,7 @@
                 S.when(asteroidHitsShip).S(function () {
                     if (g.invincible()) return;
                     g.ship().destroyed(true);
-                    g.running(false);
+                    setTimeout(g.running, 0, false);
                 });
 
                 S.when(bulletHitsAsteroid).S(function () {
@@ -228,10 +243,6 @@
                     a.remove();
                 });
 
-                new Asteroid(this, 40);
-                new Asteroid(this, 40);
-                new Asteroid(this, 40);
-
                 this.start = function () {
                     if (g.over()) return;
                     if (g.ship().destroyed()) {
@@ -252,12 +263,10 @@
                 this.fire        = function () { new Bullet(w, w.ship().tau(), w.ship()); };
                 this.pause       = function () { w.running(false); };
                 this.bench       = function () {
-                    S.once().S(function () {
-                        w.invincible(true);
-                        for (var i = 0; i < 1000; i++) {
-                            var a = new Bullet(w, Math.PI * 2 * i / 1000, w.ship());
-                        }
-                    });
+                    w.invincible(true);
+                    for (var i = 0; i < 1000; i++) {
+                        var a = new Bullet(w, Math.PI * 2 * i / 1000, w.ship());
+                    }
                 }
             }),
             Ship = Constructor(function (w, dispose) {
@@ -308,7 +317,6 @@
 
                 var t = w.t() + (Math.abs(sin) * w.width() + Math.abs(cos) * w.height()) * 0.8 / (v + firer.v());
 
-                //setTimeout(dispose, t * 1000);
                 S(function () { w.t() > t && dispose(); });
             }),
             View = function (g) {
@@ -373,6 +381,20 @@
                 );
             },
             CanvasView = function (g) {
+                /*
+                <@document.body
+                    @onkey:uparrow:down    => g.player().engineOn()
+                    @onkey:uparrow:up      => g.player().engineOff()
+                    @onkey:leftarrow:down  => g.player().turnLeft()
+                    @onkey:leftarrow:up    => g.player().stopTurning()
+                    @onkey:rightarrow:down => g.player().turnRight()
+                    @onkey:rightarrow:up   => g.player().stopTurning()
+                    @onkey:space:down      => (g.running() ? g.player().fire() : g.start())
+                    @onkey:p:down          => g.running(false)
+                    @onkey:i:down          => g.invincible(true)
+                    @onkey:b:down          => g.player().bench() />
+                */
+
                 new Html(document.body)
                 .onkey(function (d) { d('uparrow',    'down', function () { g.player().engineOn(); }); })
                 .onkey(function (d) { d('uparrow',    'up',   function () { g.player().engineOff(); }); })
@@ -456,11 +478,10 @@
                 return canvas;
             },
             game = new Game(),
-            view = S.defer().once().S(CanvasView, game);
+            view = S.on().S(CanvasView, game);
 
         document.body.appendChild(view());
     </script>
-    <script type="text/javascript" src="../surplus/dist/surplus.js"></script>
-    <script type="text/javascript" src="../S-array/src/S.array.js"></script>
+    <script type="text/javascript" src="../dist/surplus.js"></script>
 </body>
 </html>
