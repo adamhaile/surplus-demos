@@ -6,12 +6,21 @@
             margin: 40px auto;
             text-align: center;
             font-family: Helvetica;
+            border-collapse: collapse;
         }
         td {
-            width: 30px;
-            height: 30px;
-            border: 1px solid black;
-            font-size: 29px;
+            width: 40px;
+            height: 40px;
+            border-right: 1px solid black;
+            border-bottom: 1px solid black;
+            font-size: 40px;
+            line-height: 40px
+        }
+        td:last-child {
+            border-right: none;
+        }
+        tr:last-child td {
+            border-bottom: none;
         }
         td.open {
             cursor: pointer;
@@ -22,21 +31,21 @@
     <script type="text/javascript-htmlliterals">
         var X = 'X',
             O = 'O',
-            range = size => Array.apply(0, Array(size)).map((_, i) => i), // [0 .. size - 1]
+            range = size => Array.apply(0, Array(size)).map((_, i) => i), // helper to create array [0 .. size - 1]
             Game = (size, goal) => {
                 var dim    = range(size),
                     win    = range(goal),
-                    zs     = range(size - goal + 1),
-                    board  = dim.map(x => dim.map(y => S.data(null))),
+                    zs     = range(size - goal + 1), // "gap" between board size and win length
+                    board  = dim.map(x => dim.map(y => S.data(null))), // dim x dim array of data signals
                     turn   = S.data(X),
                     winner = S(() =>
                                 [X, O].find(player =>
                                     zs.some(z =>
-                                           dim.some(x => win.every(y => board[x][y + z]() === player))
-                                        || dim.some(y => win.every(x => board[x + z][y]() === player))
-                                        || zs.some(w =>
-                                               win.every(d => board[d + z][d + w]() === player)
-                                            || win.every(d => board[d + z][size - d - w - 1]() === player))))),
+                                           dim.some(x => win.every(y => board[x][y + z]() === player)) // win along x-axis
+                                        || dim.some(y => win.every(x => board[x + z][y]() === player)) // win along y-axis
+                                        || zs.some(w => // diagonal wins
+                                               win.every(d => board[d + z][d + w]() === player) // top-left-bottom-right direction
+                                            || win.every(d => board[d + z][size - d - w - 1]() === player))))), // top-right-bottom-left direction
                     over   = S(() => winner() || dim.every(x => dim.every(y => board[x][y]())));
 
                 return {
@@ -63,7 +72,7 @@
                         )</tr>
                     )</tbody>
                 </table>
-                <h5>@game.goal-in-a-row to win</h5>
+                <h5>@game.goal+"-in-a-row" to win</h5>
                 <h5 hidden = game.over()>Turn: @game.turn()</h5>
                 <h5 hidden = !game.over()>@(game.winner() ? game.winner() + " wins!" : "draw")</h5>
             game = Game(6, 4),
@@ -71,6 +80,6 @@
 
             document.body.appendChild(view);
     </script>
-    <script type="text/javascript" src="../surplus/dist/surplus.js"></script>
+    <script type="text/javascript" src="../dist/surplus.js"></script>
 </body>
 <html>
