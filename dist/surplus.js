@@ -1,597 +1,604 @@
-(function (package) {
-    // nano-implementation of require.js-like define(name, deps, impl) for internal use
-    var definitions = {};
-
-    package(function define(name, deps, fn) {
-        if (definitions.hasOwnProperty(name)) throw new Error("define: cannot redefine module " + name);
-        definitions[name] = fn.apply(null, deps.map(function (dep) {
-            if (!definitions.hasOwnProperty(dep)) throw new Error("define: module " + dep + " required by " + name + " has not been defined.");
-            return definitions[dep];
-        }));
-    });
-
-    if (typeof module === 'object' && typeof module.exports === 'object') module.exports = definitions.S; // CommonJS
-    else if (typeof define === 'function') define([], function () { return definitions.S; }); // AMD
-    else this.S = definitions.S; // fallback to global object
-
-})(function (define) {
+/// <reference path="../S.d.ts" />
+(function () {
     "use strict";
-
-define('graph', [], function () {
-
-    function Overseer() {
-        this.count = 1;
-        this.target = null;
-        this.deferred = [];
-    }
-
-    Overseer.prototype = {
-        reportReference: function reportReference(src) {
-            if (this.target) this.target.addSource(src);
-        },
-        reportFormula: function reportFormula(dispose, pin) {
-            if (this.target) this.target.addSubformula(dispose, pin);
-        },
-        runDeferred: function runDeferred() {
-            if (!this.target) {
-                while (this.deferred.length !== 0) {
-                    this.deferred.shift()();
+    // "Globals" used to keep track of current system state
+    var Time = 1, // our clock, ticks every update
+    Batching = 0, // whether we're batching data changes, 0 = no, 1+ = yes, with index to next Batch slot
+    Batch = [], // batched changes to data nodes
+    Updating = null, // whether we're updating, null = no, non-null = node being updated
+    Sampling = false, // whether we're sampling signals, with no dependencies
+    Disposing = false, // whether we're disposing
+    Disposes = []; // disposals to run after current batch of changes finishes 
+    var S = function S(fn, options) {
+        var parent = Updating, gate = (options && options.async && Gate(options.async)) || (parent && parent.gate) || null, node = new ComputationNode(fn, gate);
+        if (parent && (!options || !options.toplevel)) {
+            (parent.children || (parent.children = [])).push(node);
+        }
+        Updating = node;
+        if (Batching) {
+            node.value = fn();
+        }
+        else {
+            node.value = initialExecution(node, fn);
+        }
+        Updating = parent;
+        return function computation() {
+            if (Disposing) {
+                if (Batching)
+                    Disposes.push(node);
+                else
+                    node.dispose();
+            }
+            else if (Updating && node.fn) {
+                if (node.receiver && node.receiver.marks !== 0 && node.receiver.age === Time) {
+                    backtrack(node.receiver);
+                }
+                if (!Sampling) {
+                    if (!node.emitter)
+                        node.emitter = new Emitter(node);
+                    addEdge(node.emitter, Updating);
                 }
             }
-        }
+            return node.value;
+        };
     };
-
-    function Source(os) {
-        this.id = os.count++;
-        this.lineage = os.target ? os.target.lineage : [];
-
-        this.updates = [];
+    function initialExecution(node, fn) {
+        var result;
+        Time++;
+        Batching = 1;
+        try {
+            result = fn();
+            if (Batching > 1)
+                resolve(null);
+        }
+        finally {
+            Updating = null;
+            Batching = 0;
+        }
+        return result;
     }
-
-    Source.prototype = {
-        propagate: function propagate() {
-            var i,
-                update,
-                updates = this.updates,
-                len = updates.length;
-
-            for (i = 0; i < len; i++) {
-                update = updates[i];
-                if (update) update();
+    S.data = function data(value) {
+        var node = new DataNode(value);
+        return function data(value) {
+            if (arguments.length > 0) {
+                if (Batching) {
+                    if (node.age === Time) {
+                        if (value !== node.pending) {
+                            throw new Error("conflicting changes: " + value + " !== " + node.pending);
+                        }
+                    }
+                    else {
+                        node.age = Time;
+                        node.pending = value;
+                        Batch[Batching++] = node;
+                    }
+                }
+                else {
+                    node.age = Time;
+                    node.value = value;
+                    if (node.emitter)
+                        handleEvent(node);
+                }
+                return value;
             }
-        },
-        dispose: function () {
-            this.lineage = null;
-            this.updates.length = 0;
-        }
+            else {
+                if (Updating && !Sampling) {
+                    if (!node.emitter)
+                        node.emitter = new Emitter(null);
+                    addEdge(node.emitter, Updating);
+                }
+                return node.value;
+            }
+        };
     };
-
-    function Target(update, options, os) {
-        var i, ancestor, oldTarget;
-
-        this.lineage = os.target ? os.target.lineage.slice(0) : [];
-        this.lineage.push(this);
-        this.scheduler = options.update;
-
-        this.listening = true;
-        this.pinning = options.pinning || false;
-        this.locked = true;
-
-        this.gen = 1;
-        this.dependencies = [];
-        this.dependenciesIndex = {};
-
-        this.cleanups = [];
-        this.finalizers = [];
-
-        this.updaters = new Array(this.lineage.length + 1);
-        this.updaters[this.lineage.length] = update;
-
-        for (i = this.lineage.length - 1; i >= 0; i--) {
-            ancestor = this.lineage[i];
-            if (ancestor.scheduler) update = ancestor.scheduler(update);
-            this.updaters[i] = update;
+    S.sum = function sum(value) {
+        var node = new DataNode(value);
+        return function sum(update) {
+            if (arguments.length > 0) {
+                if (Batching) {
+                    if (node.age === Time) {
+                        node.pending = update(node.pending);
+                    }
+                    else {
+                        node.age = Time;
+                        node.pending = update(node.value);
+                        Batch[Batching++] = node;
+                    }
+                }
+                else {
+                    node.age = Time;
+                    node.value = update(node.value);
+                    if (node.emitter)
+                        handleEvent(node);
+                }
+                return value;
+            }
+            else {
+                if (Updating && !Sampling) {
+                    if (!node.emitter)
+                        node.emitter = new Emitter(null);
+                    addEdge(node.emitter, Updating);
+                }
+                return node.value;
+            }
+        };
+    };
+    S.on = function on(ev, fn, seed, options) {
+        var first = true;
+        return S(on, options);
+        function on() { typeof ev === 'function' ? ev() : multi(); first ? first = false : S.sample(next); return seed; }
+        function next() { seed = fn(seed); }
+        function multi() { for (var i = 0; i < ev.length; i++)
+            ev[i](); }
+    };
+    function Gate(scheduler) {
+        var root = new DataNode(null), scheduled = false, gotime = 0, tick;
+        root.emitter = new Emitter(null);
+        return function gate(node) {
+            if (gotime === Time)
+                return true;
+            if (typeof tick === 'function')
+                tick();
+            else if (!scheduled) {
+                scheduled = true;
+                tick = scheduler(go);
+            }
+            addEdge(root.emitter, node);
+            return false;
+        };
+        function go() {
+            if (gotime === Time)
+                return;
+            scheduled = false;
+            gotime = Time + 1;
+            if (Batching) {
+                Batch[Batching++] = root;
+            }
+            else {
+                handleEvent(root);
+            }
         }
-
-        if (options.sources) {
-            oldTarget = os.target, os.target = this;
-            this.locked = false;
+    }
+    ;
+    S.event = function event(fn) {
+        var result;
+        if (Batching) {
+            result = fn();
+        }
+        else {
+            Batching = 1;
             try {
-                for (i = 0; i < options.sources.length; i++)
-                    options.sources[i]();
-            } finally {
-                this.locked = true;
-                os.target = oldTarget;
+                result = fn();
+                handleEvent(null);
             }
-
-            this.listening = false;
+            finally {
+                Batching = 0;
+            }
         }
-    }
-
-    Target.prototype = {
-        beginUpdate: function beginUpdate() {
-            this.cleanup();
-            this.gen++;
-        },
-        endUpdate: function endUpdate() {
-            if (!this.listening) return;
-
-            var i, dep;
-
-            for (i = 0; i < this.dependencies.length; i++) {
-                dep = this.dependencies[i];
-                if (dep.active && dep.gen < this.gen) {
-                    dep.deactivate();
-                }
+        return result;
+    };
+    S.sample = function sample(fn) {
+        var result;
+        if (Updating && !Sampling) {
+            Sampling = true;
+            result = fn();
+            Sampling = false;
+        }
+        else {
+            result = fn();
+        }
+        return result;
+    };
+    S.dispose = function dispose(signal) {
+        if (Disposing) {
+            signal();
+        }
+        else {
+            Disposing = true;
+            try {
+                signal();
             }
-        },
-        addSubformula: function addSubformula(dispose, pin) {
-            if (this.locked)
-                throw new Error("Cannot create a new subformula except while updating the parent");
-            ((pin || this.pinning) ? this.finalizers : this.cleanups).push(dispose);
-        },
-        addSource: function addSource(src) {
-            if (!this.listening || this.locked) return;
-
-            var dep = this.dependenciesIndex[src.id];
-
-            if (dep) {
-                dep.activate(this.gen, src);
-            } else {
-                new Dependency(this, src);
+            finally {
+                Disposing = false;
             }
-        },
-        cleanup: function cleanup() {
-            for (var i = 0; i < this.cleanups.length; i++) {
-                this.cleanups[i]();
-            }
-            this.cleanups = [];
-        },
-        dispose: function dispose() {
-            var i;
-
-            this.cleanup();
-
-            for (i = 0; i < this.finalizers.length; i++) {
-                this.finalizers[i]();
-            }
-
-            for (i = this.dependencies.length - 1; i >= 0; i--) {
-                this.dependencies[i].deactivate();
-            }
-
-            this.lineage = null;
-            this.scheduler = null;
-            this.updaters = null;
-            this.cleanups = null;
-            this.finalizers = null;
-            this.dependencies = null;
-            this.dependenciesIndex = null;
         }
     };
-
-    function Dependency(target, src) {
-        this.active = true;
-        this.gen = target.gen;
-        this.updates = src.updates;
-        this.offset = src.updates.length;
-
-        // set i to the point where the lineages diverge
-        for (var i = 0, len = Math.min(target.lineage.length, src.lineage.length);
-            i < len && target.lineage[i] === src.lineage[i];
-            i++);
-
-        //for (var i = 0; i < target.lineage.length && i < src.lineage.length && target.lineage[i] === src.lineage[i]; i++);
-
-        this.update = target.updaters[i];
-        this.updates.push(this.update);
-
-        target.dependencies.push(this);
-        target.dependenciesIndex[src.id] = this;
+    S.cleanup = function cleanup(fn) {
+        if (Updating) {
+            (Updating.cleanups || (Updating.cleanups = [])).push(fn);
+        }
+        else {
+            throw new Error("S.cleanup() must be called from within an S() computation.  Cannot call it at toplevel.");
+        }
+    };
+    function handleEvent(change) {
+        try {
+            resolve(change);
+        }
+        finally {
+            Batching = 0;
+            Updating = null;
+            Sampling = false;
+            Disposing = false;
+        }
     }
-
-    Dependency.prototype = {
-        activate: function activate(gen, src) {
+    var _batch = [];
+    function resolve(change) {
+        var count = 0, batch, i, len;
+        if (!Batching)
+            Batching = 1;
+        if (change) {
+            Time++;
+            prepare(change.emitter);
+            notify(change.emitter);
+            i = -1, len = Disposes.length;
+            if (len) {
+                while (++i < len)
+                    Disposes[i].dispose();
+                Disposes = [];
+            }
+        }
+        // for each batch ...
+        while (Batching !== 1) {
+            // prepare globals to record next batch
+            Time++;
+            batch = Batch, Batch = _batch, _batch = batch; // rotate batch arrays
+            len = Batching, Batching = 1;
+            // set nodes' values, clear pending data, and prepare them for update
+            i = 0;
+            while (++i < len) {
+                change = batch[i];
+                change.value = change.pending;
+                change.pending = undefined;
+                if (change.emitter)
+                    prepare(change.emitter);
+            }
+            // run all updates in batch
+            i = 0;
+            while (++i < len) {
+                change = batch[i];
+                if (change.emitter)
+                    notify(change.emitter);
+                batch[i] = null;
+            }
+            // run disposes accumulated while updating
+            i = -1, len = Disposes.length;
+            if (len) {
+                while (++i < len)
+                    Disposes[i].dispose();
+                Disposes = [];
+            }
+            // if there are still changes after excessive batches, assume runaway            
+            if (count++ > 1e5) {
+                throw new Error("Runaway frames detected");
+            }
+        }
+    }
+    /// mark the node and all downstream nodes as within the range to be updated
+    function prepare(emitter) {
+        var edges = emitter.edges, i = -1, len = edges.length, edge, to, node, toEmitter;
+        emitter.emitting = true;
+        while (++i < len) {
+            edge = edges[i];
+            if (edge && (!edge.boundary || edge.to.node.gate(edge.to.node))) {
+                to = edge.to;
+                node = to.node;
+                toEmitter = node.emitter;
+                // if an earlier update threw an exception, marks may be dirty - clear it now
+                if (to.marks !== 0 && to.age < Time) {
+                    to.marks = 0;
+                    if (toEmitter)
+                        toEmitter.emitting = false;
+                }
+                // if we've come back to an emitting Emitter, that's a cycle
+                if (toEmitter && toEmitter.emitting)
+                    throw new Error("circular dependency"); // TODO: more helpful reporting
+                edge.marked = true;
+                to.marks++;
+                to.age = Time;
+                // if this is the first time to's been marked, then prepare children propagate
+                if (to.marks === 1) {
+                    if (node.children)
+                        prepareChildren(node.children);
+                    if (toEmitter)
+                        prepare(toEmitter);
+                }
+            }
+        }
+        emitter.emitting = false;
+    }
+    function prepareChildren(children) {
+        var i = -1, len = children.length, child;
+        while (++i < len) {
+            child = children[i];
+            child.fn = null;
+            if (child.children)
+                prepareChildren(child.children);
+        }
+    }
+    function notify(emitter) {
+        var i = -1, len = emitter.edges.length, edge, to;
+        while (++i < len) {
+            edge = emitter.edges[i];
+            if (edge && edge.marked) {
+                to = edge.to;
+                edge.marked = false;
+                to.marks--;
+                if (to.marks === 0) {
+                    update(to.node);
+                }
+            }
+        }
+        if (emitter.fragmented())
+            emitter.compact();
+    }
+    /// update the given node by re-executing any payload, updating inbound links, then updating all downstream nodes
+    function update(node) {
+        var emitter = node.emitter, receiver = node.receiver, disposing = node.fn === null, i, len, edge, to;
+        Updating = node;
+        disposeChildren(node);
+        node.cleanup(disposing);
+        if (!disposing)
+            node.value = node.fn();
+        if (emitter) {
+            // this is the content of notify(emitter), inserted to shorten call stack for ergonomics
+            i = -1, len = emitter.edges.length;
+            while (++i < len) {
+                edge = emitter.edges[i];
+                if (edge && edge.marked) {
+                    to = edge.to;
+                    edge.marked = false;
+                    to.marks--;
+                    if (to.marks === 0) {
+                        update(to.node);
+                    }
+                }
+            }
+            if (disposing) {
+                emitter.detach();
+            }
+            else if (emitter.fragmented())
+                emitter.compact();
+        }
+        if (receiver) {
+            if (disposing) {
+                receiver.detach();
+            }
+            else {
+                i = -1, len = receiver.edges.length;
+                while (++i < len) {
+                    edge = receiver.edges[i];
+                    if (edge.active && edge.age < Time) {
+                        edge.deactivate();
+                    }
+                }
+                if (receiver.fragmented())
+                    receiver.compact();
+            }
+        }
+    }
+    function disposeChildren(node) {
+        if (!node.children)
+            return;
+        var i = -1, len = node.children.length, child;
+        while (++i < len) {
+            child = node.children[i];
+            if (!child.receiver || child.receiver.age < Time) {
+                disposeChildren(child);
+                child.dispose();
+            }
+        }
+        node.children = null;
+    }
+    /// update the given node by backtracking its dependencies to clean state and updating from there
+    function backtrack(receiver) {
+        var updating = Updating, sampling = Sampling;
+        backtrack(receiver);
+        Updating = updating;
+        Sampling = sampling;
+        function backtrack(receiver) {
+            var i = -1, len = receiver.edges.length, edge;
+            while (++i < len) {
+                edge = receiver.edges[i];
+                if (edge && edge.marked) {
+                    if (edge.from.node && edge.from.node.receiver.marks) {
+                        // keep working backwards through the marked nodes ...
+                        backtrack(edge.from.node.receiver);
+                    }
+                    else {
+                        // ... until we find clean state, from which to start updating
+                        notify(edge.from);
+                    }
+                }
+            }
+        }
+    }
+    /// Graph classes and operations
+    var DataNode = (function () {
+        function DataNode(value) {
+            this.value = value;
+            this.age = 0; // Data nodes start at a time prior to the present, or else they can't be set in the current frame
+            this.emitter = null;
+        }
+        return DataNode;
+    })();
+    var ComputationNode = (function () {
+        function ComputationNode(fn, gate) {
+            this.fn = fn;
+            this.gate = gate;
+            this.emitter = null;
+            this.receiver = null;
+            // children and cleanups generated by last update
+            this.children = null;
+            this.cleanups = null;
+        }
+        // dispose node: free memory, dispose children, cleanup, detach from graph
+        ComputationNode.prototype.dispose = function () {
+            if (!this.fn)
+                return;
+            this.fn = null;
+            this.gate = null;
+            if (this.children) {
+                var i = -1, len = this.children.length;
+                while (++i < len) {
+                    this.children[i].dispose();
+                }
+            }
+            this.cleanup(true);
+            if (this.receiver)
+                this.receiver.detach();
+            if (this.emitter)
+                this.emitter.detach();
+        };
+        ComputationNode.prototype.cleanup = function (final) {
+            if (this.cleanups) {
+                var i = -1, len = this.cleanups.length;
+                while (++i < len) {
+                    this.cleanups[i](final);
+                }
+                this.cleanups = null;
+            }
+        };
+        return ComputationNode;
+    })();
+    var Emitter = (function () {
+        function Emitter(node) {
+            this.node = node;
+            this.id = Emitter.count++;
+            this.emitting = false;
+            this.edges = [];
+            this.index = [];
+            this.active = 0;
+            this.edgesAge = 0;
+        }
+        Emitter.prototype.detach = function () {
+            var i = -1, len = this.edges.length, edge;
+            while (++i < len) {
+                edge = this.edges[i];
+                if (edge)
+                    edge.deactivate();
+            }
+        };
+        Emitter.prototype.fragmented = function () {
+            return this.edges.length > 10 && this.edges.length / this.active > 4;
+        };
+        Emitter.prototype.compact = function () {
+            var i = -1, len = this.edges.length, edges = [], compaction = ++this.edgesAge, edge;
+            while (++i < len) {
+                edge = this.edges[i];
+                if (edge) {
+                    edge.slot = edges.length;
+                    edge.slotAge = compaction;
+                    edges.push(edge);
+                }
+            }
+            this.edges = edges;
+        };
+        Emitter.count = 0;
+        return Emitter;
+    })();
+    function addEdge(from, to) {
+        var edge = null;
+        if (!to.receiver)
+            to.receiver = new Receiver(to);
+        else
+            edge = to.receiver.index[from.id];
+        if (edge)
+            edge.activate(from);
+        else
+            new Edge(from, to.receiver, to.gate && (from.node === null || to.gate !== from.node.gate));
+    }
+    var Receiver = (function () {
+        function Receiver(node) {
+            this.node = node;
+            this.id = Emitter.count++;
+            this.marks = 0;
+            this.age = Time;
+            this.edges = [];
+            this.index = [];
+            this.active = 0;
+        }
+        Receiver.prototype.detach = function () {
+            var i = -1, len = this.edges.length;
+            while (++i < len) {
+                this.edges[i].deactivate();
+            }
+        };
+        Receiver.prototype.fragmented = function () {
+            return this.edges.length > 10 && this.edges.length / this.active > 4;
+        };
+        Receiver.prototype.compact = function () {
+            var i = -1, len = this.edges.length, edges = [], index = [], edge;
+            while (++i < len) {
+                edge = this.edges[i];
+                if (edge.active) {
+                    edges.push(edge);
+                    index[edge.from.id] = edge;
+                }
+            }
+            this.edges = edges;
+            this.index = index;
+        };
+        Receiver.count = 0;
+        return Receiver;
+    })();
+    var Edge = (function () {
+        function Edge(from, to, boundary) {
+            this.from = from;
+            this.to = to;
+            this.boundary = boundary;
+            this.age = Time;
+            this.active = true;
+            this.marked = false;
+            this.slot = from.edges.length;
+            this.slotAge = from.edgesAge;
+            from.edges.push(this);
+            to.edges.push(this);
+            to.index[from.id] = this;
+            from.active++;
+            to.active++;
+        }
+        Edge.prototype.activate = function (from) {
             if (!this.active) {
                 this.active = true;
-                this.updates = src.updates;
-                this.updates[this.offset] = this.update;
+                if (this.slotAge === from.edgesAge) {
+                    from.edges[this.slot] = this;
+                }
+                else {
+                    this.slotAge = from.edgesAge;
+                    this.slot = from.edges.length;
+                    from.edges.push(this);
+                }
+                this.to.active++;
+                from.active++;
+                this.from = from;
             }
-            this.gen = gen;
-        },
-        deactivate: function deactivate() {
-            if (this.active) {
-                this.updates[this.offset] = null;
-                this.updates = null;
-            }
+            this.age = Time;
+        };
+        Edge.prototype.deactivate = function () {
+            if (!this.active)
+                return;
+            var from = this.from, to = this.to;
             this.active = false;
-        }
-    };
-
-    return {
-        Overseer: Overseer,
-        Source: Source,
-        Target: Target,
-        Dependency: Dependency
-    };
-});
-
-define('core', ['graph'], function (graph) {
-    var os = new graph.Overseer();
-
-    return {
-        data:           data,
-        FormulaOptions: FormulaOptions,
-        formula:        formula,
-        defer:          defer,
-        peek:           peek,
-        pin:            pin,
-        cleanup:        cleanup,
-        finalize:       finalize
-    }
-
-    function data(value) {
-        var src = new graph.Source(os);
-
-        data.toJSON = signalToJSON;
-
-        return data;
-
-        function data(newValue) {
-            if (arguments.length > 0) {
-                value = newValue;
-                src.propagate();
-                os.runDeferred();
-            } else {
-                os.reportReference(src);
-            }
-            return value;
-        }
-    }
-
-    function FormulaOptions() {
-        this.sources = null;
-        this.pin     = false;
-        this.update  = null;
-        this.init    = null;
-    }
-
-    function formula(fn, options) {
-        var src = new graph.Source(os),
-            tgt = new graph.Target(update, options, os),
-            value,
-            updating;
-
-        // register dispose before running fn, in case it throws
-        os.reportFormula(dispose, options.pin);
-
-        formula.dispose = dispose;
-        //formula.toString = toString;
-        formula.toJSON = signalToJSON;
-
-        (options.init ? options.init(update) : update)();
-
-        os.runDeferred();
-
-        return formula;
-
-        function formula() {
-            if (src) os.reportReference(src);
-            return value;
-        }
-
-        function update() {
-            if (updating || !tgt) return;
-            updating = true;
-
-            var oldTarget;
-
-            oldTarget = os.target, os.target = tgt;
-
-            tgt.beginUpdate();
-            tgt.locked = false;
-
-            try {
-                value = fn();
-                if (tgt) tgt.locked = true;
-                if (src) src.propagate(); // executing fn might have disposed us (!)
-            } finally {
-                updating = false;
-                if (tgt) tgt.locked = true;
-                os.target = oldTarget;
-            }
-
-            if (tgt) tgt.endUpdate();
-        }
-
-        function dispose() {
-            if (src) {
-                src.dispose();
-                tgt.dispose();
-            }
-            src = tgt = fn = value = undefined;
-        }
-
-        //function toString() {
-        //    return "[formula: " + (value !== undefined ? value + " - " : "") + fn + "]";
-        //}
-    }
-
-    function signalToJSON() {
-        return this();
-    }
-
-    function peek(fn) {
-        if (os.target && os.target.listening) {
-            os.target.listening = false;
-
-            try {
-                return fn();
-            } finally {
-                os.target.listening = true;
-            }
-        } else {
-            return fn();
-        }
-    }
-
-    function pin(fn) {
-        if (os.target && !os.target.pinning) {
-            os.target.pinning = true;
-
-            try {
-                return fn();
-            } finally {
-                os.target.pinning = false;
-            }
-        } else {
-            return fn();
-        }
-    }
-
-    function defer(fn) {
-        if (os.target) {
-            os.deferred.push(fn);
-        } else {
-            fn();
-        }
-    }
-
-    function cleanup(fn) {
-        if (os.target) {
-            os.target.cleanups.push(fn);
-        } else {
-            throw new Error("S.cleanup() must be called from within an S.formula.  Cannot call it at toplevel.");
-        }
-    }
-
-    function finalize(fn) {
-        if (os.target) {
-            os.target.finalizers.push(fn);
-        } else {
-            throw new Error("S.finalize() must be called from within an S.formula.  Cannot call it at toplevel.");
-        }
-    }
-});
-
-define('schedulers', ['core'], function (core) {
-
-    return {
-        stop:     stop,
-        pause:    pause,
-        defer:    defer,
-        throttle: throttle,
-        debounce: debounce,
-        stopsign: stopsign,
-        when:     when
-    };
-
-    function stop(update) {
-        return function stopped() { }
-    }
-
-    function pause(collector) {
-        return function (update) {
-            var scheduled = false;
-
-            return function paused() {
-                if (scheduled) return;
-                scheduled = true;
-
-                collector(function resume() {
-                    scheduled = false;
-                    update();
-                });
-            }
+            from.edges[this.slot] = null;
+            from.active--;
+            to.active--;
+            this.from = null;
         };
+        return Edge;
+    })();
+    // UMD exporter
+    /* globals define */
+    if (typeof module === 'object' && typeof module.exports === 'object') {
+        module.exports = S; // CommonJS
     }
-
-    function defer(fn) {
-        return pause(core.defer);
+    else if (typeof define === 'function') {
+        define([], function () { return S; }); // AMD
     }
-
-    function throttle(t) {
-        return function throttle(update) {
-            var last = 0,
-            scheduled = false;
-
-            return function throttle() {
-                if (scheduled) return;
-
-                var now = Date.now();
-
-                if ((now - last) > t) {
-                    last = now;
-                    update();
-                } else {
-                    scheduled = true;
-                    setTimeout(function throttled() {
-                        last = Date.now();
-                        scheduled = false;
-                        update();
-                    }, t - (now - last));
-                }
-            };
-        };
+    else {
+        (eval || function () { })("this").S = S; // fallback to global object
     }
-
-    function debounce(t) {
-        return function (update) {
-            var last = 0,
-                tout = 0;
-
-            return function () {
-                var now = Date.now();
-
-                if (now > last) {
-                    last = now;
-                    if (tout) clearTimeout(tout);
-
-                    tout = setTimeout(function debounce() { update(); }, t);
-                }
-            };
-        };
-    }
-
-    function stopsign() {
-        var updates = [];
-
-        collector.go = go;
-
-        return collector;
-
-        function collector(update) {
-            updates.push(update);
-        }
-
-        function go() {
-            for (var i = 0; i < updates.length; i++) {
-                updates[i]();
-            }
-            updates = [];
-        }
-    }
-
-    function when(preds) {
-        return function when(update) {
-            for (var i = 0; i < preds.length; i++) {
-                if (preds[i]() === undefined) return;
-            }
-            update();
-        }
-    }
-});
-
-define('options', ['core', 'schedulers'], function (core, schedulers) {
-
-    function FormulaOptionsBuilder() {
-        this.options = new core.FormulaOptions();
-    }
-
-    FormulaOptionsBuilder.prototype = {
-        on: function (l) {
-            l = !l ? [] : !Array.isArray(l) ? [l] : l;
-            this.options.sources = maybeConcat(this.options.sources, l);
-            return this;
-        },
-        once: function () {
-            this.options.sources = [];
-            return this;
-        },
-        pin: function () {
-            this.options.pin = true;
-            return this;
-        },
-        when: function (l) {
-            l = !l ? [] : !Array.isArray(l) ? [l] : l;
-            this.options.sources = maybeConcat(this.options.sources, l);
-            var scheduler = schedulers.pause(schedulers.when(l));
-            composeInit(this, scheduler);
-            composeUpdate(this, scheduler);
-            return this;
-        }
-    };
-
-    // add methods for schedulers
-    'defer throttle debounce pause'.split(' ').map(function (method) {
-        FormulaOptionsBuilder.prototype[method] = function (v) { composeUpdate(this, schedulers[method](v)); return this; };
-    });
-
-    return {
-        FormulaOptionsBuilder: FormulaOptionsBuilder
-    };
-
-    function maybeCompose(f, g) { return g ? function compose() { return f(g()); } : f; }
-    function maybeConcat(a, b) { return a ? a.concat(b) : b; }
-    function composeUpdate(b, fn) { b.options.update = maybeCompose(fn, b.options.update); }
-    function composeInit(b, fn) { b.options.init = maybeCompose(fn, b.options.init); }
-});
-
-define('misc', [], function () {
-    return {
-        proxy: proxy
-    };
-
-    function proxy(getter, setter) {
-        return function proxy(value) {
-            if (arguments.length !== 0) setter(value);
-            return getter();
-        };
-    }
-});
-
-define('S', ['core', 'options', 'schedulers', 'misc'], function (core, options, schedulers, misc) {
-    // build our top-level object S
-    function S(fn /*, ...args */) {
-        var _fn, _args;
-        if (arguments.length > 1) {
-            _fn = fn;
-            _args = Array.prototype.slice.call(arguments, 1);
-            fn = function () { return _fn.apply(null, _args); };
-        }
-
-        return core.formula(fn, new core.FormulaOptions());
-    }
-
-    S.data      = core.data;
-    S.peek      = core.peek;
-    S.cleanup   = core.cleanup;
-    S.finalize  = core.finalize;
-
-    // add methods to S for formula options builder
-    'on once when defer throttle debounce pause'.split(' ').map(function (method) {
-        S[method] = function (v) { return new options.FormulaOptionsBuilder()[method](v); };
-    });
-
-    // S.pin is either an option for a formula being created or the marker of a region where all subs are pinned
-    S.pin = function pin(fn) {
-        if (arguments.length === 0) {
-            return new options.FormulaOptionsBuilder().pin();
-        } else {
-            core.pin(fn);
-        }
-    }
-
-    // enable creation of formula from options builder
-    options.FormulaOptionsBuilder.prototype.S = function S(fn /*, args */) {
-        var _fn, _args;
-        if (arguments.length > 1) {
-            _fn = fn;
-            _args = Array.prototype.slice.call(arguments, 1);
-            fn = function () { return _fn.apply(null, _args); };
-        }
-
-        return core.formula(fn, this.options);
-    }
-
-    S.stopsign = schedulers.stopsign;
-
-    S.proxy = misc.proxy;
-
-    return S;
-})
-
-});
+})();
 
 // sets, unordered and ordered, for S.js
 (function (package) {
@@ -609,7 +616,7 @@ define('S', ['core', 'options', 'schedulers', 'misc'], function (core, options, 
         if (!Array.isArray(values))
             throw new Error("S.array must be initialized with an array");
 
-        var array = S.data(values);
+        var data = S.data(values);
 
         // add mutators
         array.pop       = pop;
@@ -623,6 +630,73 @@ define('S', ['core', 'options', 'schedulers', 'misc'], function (core, options, 
         array.removeAll = removeAll;
 
         return transformer(array);
+        
+        function array(newvalues) {
+            if (arguments.length > 0) {
+                values = newvalues;
+                return data(newvalues);
+            } else {
+                return data();
+            }
+        }
+        
+        // mutators
+        function push(item) {
+            values.push(item);
+            data(values);
+            return array;
+        }
+    
+        function pop(item) {
+            var value = values.pop();
+            data(values);
+            return value;
+        }
+    
+        function unshift(item) {
+            values.unshift(item);
+            data(values);
+            return array;
+        }
+    
+        function shift(item) {
+            var value = values.shift();
+            data(values);
+            return value;
+        }
+    
+        function splice(index, count, item) {
+            Array.prototype.splice.apply(values, arguments);
+            data(values);
+            return array;
+        }
+    
+        function remove(item) {
+            for (var i = 0; i < values.length; i++) {
+                if (values[i] === item) {
+                    values.splice(i, 1);
+                    break;
+                }
+            }
+            
+            data(values);
+            return array;
+        }
+    
+        function removeAll(item) {
+            var i = 0;
+    
+            while (i < values.length) {
+                if (values[i] === item) {
+                    values.splice(i, 1);
+                } else {
+                    i++;
+                }
+            }
+            
+            data(values);
+            return array;
+        }
     }
 
     // util to add transformer methods
@@ -651,27 +725,22 @@ define('S', ['core', 'options', 'schedulers', 'misc'], function (core, options, 
         s.orderBy     = orderBy;
 
         // schedulers
-        s.defer       = defer;
-        s.throttle    = throttle;
-        s.debounce    = debounce;
-        s.pause       = pause;
+        s.async        = async;
 
         return s;
     }
 
-    function mapS(enter, exit, move) {
+    function mapS(fn) {
         var seq = this,
             items = [],
             mapped = [],
             len = 0;
 
-        var mapS = S.on(seq).S(function mapS() {
+        var mapS = S(function mapS() {
             var new_items = seq(),
                 new_len = new_items.length,
                 temp = new Array(new_len),
-                from = [],
-                to = [],
-                i, j, k, item, enterItem;
+                i, j, k, item;
 
             // 1) step through all old items and see if they can be found in the new set; if so, save them in a temp array and mark them moved; if not, exit them
             NEXT:
@@ -680,34 +749,26 @@ define('S', ['core', 'options', 'schedulers', 'misc'], function (core, options, 
                 for (j = 0; j < new_len; j++, k = (k + 1) % new_len) {
                     if (items[i] === new_items[k] && !temp.hasOwnProperty(k)) {
                         temp[k] = item;
-                        if (i !== k) { from.push(i); to.push(k); }
                         k = (k + 1) % new_len;
                         continue NEXT;
                     }
                 }
-                if (exit) exit(item, i);
-                enter && item.dispose();
+                S.dispose(item);
             }
 
-            if (move && from.length) move(from, to);
-
             // 2) set all the new values, pulling from the temp array if copied, otherwise entering the new value
-            for (var i = 0; i < new_len; i++) {
+            for (i = 0; i < new_len; i++) {
                 if (temp.hasOwnProperty(i)) {
                     mapped[i] = temp[i];
                 } else {
                     item = new_items[i];
-                    if (enter) {
-                        // capture the current value of item and i in a closure
-                        enterItem = (function (item, i) {
-                                        return function () { return enter(item, i); };
-                                    })(item, i);
-                        mapped[i] = S.pin().S(enterItem);
-                    } else {
-                        mapped[i] = item;
-                    }
+                    mapped[i] = (function (item, i) { 
+                        return S(function () { return fn(item, i); }, { toplevel: true }); 
+                    })(item, i);
                 }
             }
+            
+            S.cleanup(function (final) { if (final) mapped.map(S.dispose); });
 
             // 3) in case the new set is shorter than the old, set the length of the mapped array
             len = mapped.length = new_len;
@@ -720,13 +781,13 @@ define('S', ['core', 'options', 'schedulers', 'misc'], function (core, options, 
 
         return transformer(mapS);
     }
-
+    
     function forEach(enter, exit, move) {
         var seq = this,
             items = [],
             len = 0;
 
-        var forEach = S.on(seq).S(function forEach() {
+        var forEach = S(function forEach() {
             var new_items = seq(),
                 new_len = new_items.length,
                 found = new Array(new_len),
@@ -753,7 +814,7 @@ define('S', ['core', 'options', 'schedulers', 'misc'], function (core, options, 
 
             // 2) set all the new values, pulling from the temp array if copied, otherwise entering the new value
             if (enter) {
-                S.pin(function forEach() {
+                S.sample(function forEach() {
                     for (var i = 0; i < new_len; i++) {
                         if (!found[i]) enter(new_items[i], i);
                     }
@@ -934,98 +995,9 @@ define('S', ['core', 'options', 'schedulers', 'misc'], function (core, options, 
         }));
     }
 
-    // mutators
-    function push(item) {
-        var values = S.peek(this);
-
-        values.push(item);
-        this(values);
-
-        return this;
-    }
-
-    function pop(item) {
-        var values = S.peek(this),
-            value = values.pop();
-
-        this(values);
-
-        return value;
-    }
-
-    function unshift(item) {
-        var values = S.peek(this);
-
-        values.unshift(item);
-        this(values);
-
-        return this;
-    }
-
-    function shift(item) {
-        var values = S.peek(this),
-            value = values.shift();
-
-        this(values);
-
-        return value;
-    }
-
-    function splice(index, count, item) {
-        var values = S.peek(this);
-
-        Array.prototype.splice.apply(values, arguments);
-        this(values);
-
-        return this;
-    }
-
-    function remove(item) {
-        var values = S.peek(this);
-
-        for (var i = 0; i < values.length; i++) {
-            if (values[i] === item) {
-                values.splice(i, 1);
-                break;
-            }
-        }
-
-        this(values);
-
-        return this;
-    }
-
-    function removeAll(item) {
-        var values = S.peek(this),
-            i = 0;
-
-        while (i < values.length) {
-            if (values[i] === item) {
-                values.splice(i, 1);
-            } else {
-                i++;
-            }
-        }
-
-        this(values);
-
-        return this;
-    }
-
     // schedulers
-    function defer() {
-        return transformer(S.defer().S(this));
-    }
-
-    function throttle(t) {
-        return transformer(S.throttle(t).S(this));
-    }
-    function debounce(t) {
-        return transformer(S.debounce(t).S(this));
-    }
-
-    function pause(collector) {
-        return transformer(S.pause(collector).S(this));
+    function async(scheduler) {
+        return transformer(S.async(scheduler).S(this));
     }
 });
 
@@ -1156,7 +1128,7 @@ define('sourcemap', [], function () {
         var extract = extractMap(src, original),
             appended = extract.src
               + "\n//# sourceMappingURL=data:"
-              + escape(JSON.stringify(extract.map));
+              + encodeURIComponent(JSON.stringify(extract.map));
 
         return appended;
     }
@@ -1207,6 +1179,12 @@ define('tokenize', [], function () {
     // pre-compiled regular expressions
     var rx = {
         tokens: /<\/?(?=\w)|\/?>|<!--|-->|@|=|\)|\(|\[|\]|\{|\}|"|'|\/\/|\n|\/\*|\*\/|(?:[^<>@=\/@=()[\]{}"'\n*-]|(?!-->)-|\/(?![>/*])|\*(?!\/)|(?!<\/?\w|<!--)<\/?)+/g,
+        //       |          |    |    |   | +- =
+        //       |          |    |    |   +- @
+        //       |          |    |    +- -->
+        //       |          |    +- <!--
+        //       |          +- /> or >
+        //       +- < or </ followed by \w
     };
 
     return function tokenize(str, opts) {
@@ -1214,94 +1192,6 @@ define('tokenize', [], function () {
 
         return toks;
         //return TokenStream(toks);
-    }
-
-    function TokenStream(toks) {
-        var i       = 0,
-            eof     = toks.length === 0,
-            tok     = !eof && toks[i],
-            line    = 0,
-            col     = 0;
-
-        return {
-            TOK:      function TOK() { return TOK; },
-            EOF:      function EOF() { return EOF; },
-            NEXT:     NEXT,
-            ERR:      ERR,
-            IS:       IS,
-            NOT:      NOT,
-            MATCH:    MATCH,
-            WS:       WS,
-            SPLIT:    SPLIT,
-            LOC:      LOC,
-            MARK:     MARK,
-            ROLLBACK: ROLLBACK
-        };
-
-        // token stream ops
-        function NEXT() {
-            if (tok === "\n") line++, col = 0;
-            else if (tok) col += tok.length;
-
-            if (++i >= toks.length) eof = true, tok = null;
-            else tok = toks[i];
-        }
-
-        function ERR(msg) {
-            throw new Error(msg);
-        }
-
-        function IS(t) {
-            return tok === t;
-        }
-
-        function NOT(t) {
-            return tok !== t;
-        }
-
-        function MATCH(rx) {
-            return rx.test(tok);
-        }
-
-        function WS() {
-            return !!MATCH(rx.ws);
-        }
-
-        function SPLIT(rx) {
-            var m = rx.exec(tok);
-            if (m && (m = m[0])) {
-                col += m.length;
-                tok = tok.substring(m.length);
-                if (tok === "") NEXT();
-                return m;
-            } else {
-                return null;
-            }
-        }
-
-        function LOC() {
-            return { line: line, col: col };
-        }
-
-        function MARK() {
-            return {
-                tok:     tok,
-                i:       i,
-                eof:     eof,
-                line:    line,
-                col:     col,
-                segment: segment
-            };
-        }
-
-        function ROLLBACK(mark) {
-            tok     = mark.tok;
-            i       = mark.i;
-            eof     = mark.eof;
-            line    = mark.line;
-            col     = mark.col;
-            segment = mark.segment;
-        }
     }
 });
 
@@ -1320,10 +1210,10 @@ define('AST', [], function () {
         HtmlLiteral: function(nodes) {
             this.nodes = nodes; // [ HtmlElement | HtmlComment | HtmlText(ws only) | HtmlInsert ]
         },
-        HtmlElement: function(beginTag, properties, directives, content, endTag) {
+        HtmlElement: function(beginTag, properties, mixins, content, endTag) {
             this.beginTag = beginTag; // string
             this.properties = properties; // [ Property ]
-            this.directives = directives; // [ Directive | AttrStyleDirective ]
+            this.mixins = mixins; // [ Mixin ]
             this.content = content; // [ HtmlElement | HtmlComment | HtmlText | HtmlInsert ]
             this.endTag = endTag; // string | null
         },
@@ -1336,20 +1226,12 @@ define('AST', [], function () {
         HtmlInsert: function (code) {
             this.code = code; // EmbeddedCode
         },
-        Property: function (name, code, callback) {
-            this.name = name; // string
-            this.code = code; // EmbeddedCode
-            this.callback = callback; // bool
-        },
-        Directive: function (name, code) {
+        Property: function (name, code) {
             this.name = name; // string
             this.code = code; // EmbeddedCode
         },
-        AttrStyleDirective: function (name, params, code, callback) {
-            this.name = name; // string
-            this.params = params; // [ string ]
+        Mixin: function (code) {
             this.code = code; // EmbeddedCode
-            this.callback = callback; // bool
         }
     };
 });
@@ -1358,14 +1240,12 @@ define('parse', ['AST'], function (AST) {
 
     // pre-compiled regular expressions
     var rx = {
-        propertyLeftSide   : /\s(\S+)\s*=>?\s*$/,
-        embeddedCodePrefix : /^[+\-!~]*[a-zA-Z_$][a-zA-Z_$0-9]*/, // prefix unary operators + identifier
-        embeddedCodeInterim: /^(?:\.[a-zA-Z_$][a-zA-Z_$0-9]*)+/, // property chain, like .bar.blech
-        embeddedCodeSuffix : /^\+\+|--/, // suffix unary operators
-        directiveName      : /^[a-zA-Z_$][a-zA-Z_$0-9]*(:[^\s:=]*)*/, // like "foo:bar:blech"
+        propertyLeftSide   : /\s(\S+)\s*=\s*$/,
         stringEscapedEnd   : /[^\\](\\\\)*\\$/, // ending in odd number of escape slashes = next char of string escaped
         ws                 : /^\s*$/,
         leadingWs          : /^\s+/,
+        codeTerminator     : /^[\s<>/,;)\]}]/,
+        codeContinuation   : /^[^\s<>/,;)\]}]+/,
         tagTrailingWs      : /\s+(?=\/?>$)/,
         emptyLines         : /\n\s+(?=\n)/g
     };
@@ -1428,6 +1308,7 @@ define('parse', ['AST'], function (AST) {
                 } else if (IS('@')) {
                     nodes.push(htmlInsert());
                 } else {
+                    // look ahead to see if coming text is whitespace followed by another node
                     mark = MARK();
                     wsText = htmlWhitespaceText();
 
@@ -1449,7 +1330,7 @@ define('parse', ['AST'], function (AST) {
             var start = LOC(),
                 beginTag = "",
                 properties = [],
-                directives = [],
+                mixins = [],
                 content = [],
                 endTag = "",
                 hasContent = true;
@@ -1459,7 +1340,7 @@ define('parse', ['AST'], function (AST) {
             // scan for attributes until end of opening tag
             while (!EOF && NOT('>') && NOT('/>')) {
                 if (IS('@')) {
-                    directives.push(directive());
+                    mixins.push(mixin());
                 } else if (IS('=')) {
                     beginTag = property(beginTag, properties);
                 } else {
@@ -1500,7 +1381,7 @@ define('parse', ['AST'], function (AST) {
                 endTag += TOK, NEXT();
             }
 
-            return new AST.HtmlElement(beginTag, properties, directives, content, endTag);
+            return new AST.HtmlElement(beginTag, properties, mixins, content, endTag);
         }
 
         function htmlText() {
@@ -1551,98 +1432,51 @@ define('parse', ['AST'], function (AST) {
             if(NOT('=')) ERR("not at equals sign of a property assignment");
 
             var match,
-                name,
-                callback = false;
+                name;
 
             beginTag += TOK, NEXT();
-
-            if (IS('>')) callback = true, beginTag += TOK, NEXT();
 
             if (WS()) beginTag += TOK, NEXT();
 
             match = rx.propertyLeftSide.exec(beginTag);
 
             // check if it's an attribute not a property assignment
-            if (match && (callback || (NOT('"') && NOT("'")))) {
+            if (match && NOT('"') && NOT("'")) {
                 beginTag = beginTag.substring(0, beginTag.length - match[0].length);
 
                 name = match[1];
 
                 SPLIT(rx.leadingWs);
 
-                properties.push(new AST.Property(name, embeddedCode(), callback));
+                properties.push(new AST.Property(name, embeddedCode()));
             }
 
             return beginTag;
         }
 
-        function directive() {
-            if (NOT('@')) ERR("not at start of directive");
+        function mixin() {
+            if (NOT('@')) ERR("not at start of mixin");
 
             NEXT();
 
-            var name = SPLIT(rx.directiveName),
-                text,
-                segments,
-                loc,
-                callback = false;
-
-            if (!name) ERR("directive must have name");
-
-            if (IS('(')) {
-                segments = [];
-                loc = LOC();
-                text = balancedParens(segments, "", loc);
-                if (text) segments.push(new AST.CodeText(text, loc));
-
-                return new AST.Directive(name, new AST.EmbeddedCode(segments));
-            } else {
-                if (WS()) NEXT();
-
-                if (NOT('=')) ERR("unrecognized directive - must have form like @foo:bar = ... or @foo( ... )");
-
-                NEXT();
-
-                if (IS('>')) callback = true, NEXT();
-
-                SPLIT(rx.leadingWs);
-
-                name = name.split(":");
-
-                return new AST.AttrStyleDirective(name[0], name.slice(1), embeddedCode(), callback);
-            }
+            return new AST.Mixin(embeddedCode());
         }
 
         function embeddedCode() {
             var start = LOC(),
                 segments = [],
                 text = "",
-                part,
                 loc = LOC();
 
-            // consume any initial operators and identifier (!foo)
-            if (part = SPLIT(rx.embeddedCodePrefix)) {
-                text += part;
-
-                // consume any property chain (.bar.blech)
-                if (part = SPLIT(rx.embeddedCodeInterim)) {
-                    text += part;
+            // consume source text up to the first top-level terminating character
+            while(!EOF && !MATCH(rx.codeTerminator)) {
+                if (PARENS()) {
+                    text = balancedParens(segments, text, loc);
+                } else if (IS("'") || IS('"')) {
+                    text += quotedString();
+                } else {
+                    text += SPLIT(rx.codeContinuation);
                 }
-            }
-
-            // consume any sets of balanced parentheses
-            while (PARENS()) {
-                text = balancedParens(segments, text, loc);
-
-                // consume interim property chain (.blech.gorp)
-                if (part = SPLIT(rx.embeddedCodeInterim)) {
-                    text += part;
-                }
-            }
-
-            // consume any operator suffix (++, --)
-            if (part = SPLIT(rx.embeddedCodeSuffix)) {
-                text += part;
             }
 
             if (text) segments.push(new AST.CodeText(text, loc));
@@ -1653,7 +1487,8 @@ define('parse', ['AST'], function (AST) {
         }
 
         function balancedParens(segments, text, loc) {
-            var end = PARENS();
+            var start = LOC(),
+                end = PARENS();
 
             if (end === undefined) ERR("not in parentheses");
 
@@ -1666,20 +1501,20 @@ define('parse', ['AST'], function (AST) {
                     text += codeSingleLineComment();
                 } else if (IS('/*')) {
                     text += codeMultiLineComment();
-                } else if (IS("<") || IS('<!--')) {
+                } else if (IS("<") || IS('<!--') || IS('@')) {
                     if (text) segments.push(new AST.CodeText(text, { line: loc.line, col: loc.col }));
                     text = "";
                     segments.push(htmlLiteral());
                     loc.line = LINE;
                     loc.col = COL;
-                } else if (IS('(')) {
+                } else if (PARENS()) {
                     text = balancedParens(segments, text, loc);
                 } else {
                     text += TOK, NEXT();
                 }
             }
 
-            if (EOF) ERR("unterminated parentheses");
+            if (EOF) ERR("unterminated parentheses", start);
 
             text += TOK, NEXT();
 
@@ -1808,14 +1643,13 @@ define('parse', ['AST'], function (AST) {
             LINE = mark.LINE;
             COL = mark.COL;
         }
-    }
+    };
 });
 
 define('genCode', ['AST', 'sourcemap'], function (AST, sourcemap) {
 
     // pre-compiled regular expressions
     var rx = {
-        eventProperty      : /^on/,
         backslashes        : /\\/g,
         newlines           : /\n/g,
         singleQuotes       : /'/g,
@@ -1832,7 +1666,7 @@ define('genCode', ['AST', 'sourcemap'], function (AST, sourcemap) {
             + this.text
             + (opts.sourcemap ? sourcemap.segmentEnd() : "");
     };
-    var htmlLiteralId = 0; //Math.floor(Math.random() * Math.pow(2, 31));
+    var htmlLiteralId = 0;
     AST.HtmlLiteral.prototype.genCode = function (opts, prior) {
         var html = concatResults(opts, this.nodes, 'genHtml'),
             nl = "\n" + indent(prior),
@@ -1858,39 +1692,25 @@ define('genCode', ['AST', 'sourcemap'], function (AST, sourcemap) {
     AST.HtmlElement.prototype.genDirectives = function (opts, nl) {
         var childDirectives = genChildDirectives(opts, this.content, nl),
             properties = concatResults(opts, this.properties, 'genDirective', nl),
-            directives = concatResults(opts, this.directives, 'genDirective', nl);
+            mixins = concatResults(opts, this.mixins, 'genDirective', nl);
 
-        return properties + (properties && (directives || childDirectives) ? nl : "")
-            + directives + (directives && childDirectives ? nl : "")
-            + childDirectives;
+        return childDirectives + (childDirectives && (properties || mixins) ? nl : "")
+            + properties + (properties && mixins ? nl : "")
+            + mixins;
     };
     AST.HtmlComment.prototype.genDirectives =
     AST.HtmlText.prototype.genDirectives    = function (opts, nl) { return null; };
     AST.HtmlInsert.prototype.genDirectives  = function (opts, nl) {
-        return new AST.AttrStyleDirective('insert', [], this.code, false).genDirective(opts);
+        return ".insert(function () { return " + this.code.genCode(opts) + "; })";
     }
 
     // genDirective
     AST.Property.prototype.genDirective = function (opts) {
         var code = this.code.genCode(opts);
-        if (this.callback) code = genCallback(this.name, code);
         return ".property(function (__) { __." + this.name + " = " + code + "; })";
     };
-    AST.Directive.prototype.genDirective = function (opts) {
-        return "." + this.name + "(function (__) { __" + this.code.genCode(opts) + "; })";
-    };
-    AST.AttrStyleDirective.prototype.genDirective = function (opts) {
-        var code = "." + this.name + "(function (__) { __(";
-
-        for (var i = 0; i < this.params.length; i++)
-            code += codeStr(this.params[i]) + ", ";
-
-        code += this.callback ? genCallback(this.name, this.code.genCode(opts))
-                              : this.code.genCode(opts);
-
-        code += "); })";
-
-        return code;
+    AST.Mixin.prototype.genDirective = function (opts) {
+        return ".mixin(function () { return " + this.code.genCode(opts) + "; })";
     };
 
     function genChildDirectives(opts, childNodes, nl) {
@@ -1943,11 +1763,6 @@ define('genCode', ['AST', 'sourcemap'], function (AST, sourcemap) {
                    + "'";
     }
 
-    function genCallback(name, code) {
-        var param = rx.eventProperty.test(name) ? name.substring(2) : "__";
-        return "function (" + param + ") { " + code + " }";
-    }
-
     function indent(prior) {
         var lastline = rx.lastline.exec(prior);
         lastline = lastline ? lastline[0] : '';
@@ -1967,6 +1782,13 @@ define('genCode', ['AST', 'sourcemap'], function (AST, sourcemap) {
 // Cross-browser compatibility shims
 define('shims', ['AST'], function (AST) {
 
+    // can only probe for shims if we're running in a browser
+    if (!this || !this.document) return false;
+    
+    var rx = {
+        ws: /^\s*$/
+    };
+    
     var shimmed = false;
 
     // add base shim methods that visit AST
@@ -1996,7 +1818,7 @@ define('shims', ['AST'], function (AST) {
 
     function addFEFFtoWhitespaceTextNodes() {
         shim(AST.HtmlText, function (ctx) {
-            if (ws.test(this.text) && !(ctx.parent instanceof AST.HtmlAttr)) {
+            if (rx.ws.test(this.text) && !(ctx.parent instanceof AST.HtmlAttr)) {
                 this.text = '&#xfeff;' + this.text;
             }
         });
@@ -2092,7 +1914,8 @@ define('preprocess', ['tokenize', 'parse', 'shims', 'sourcemap'], function (toke
 
 // internal cross-browser library of required DOM functions
 define('domlib', [], function () {
-    return {
+    // default (conformant) implementations
+    var domlib = {
         addEventListener: function addEventListener(node, event, fn) {
             node.addEventListener(event, fn, false);
         },
@@ -2111,8 +1934,36 @@ define('domlib', [], function () {
 
         classListRemove: function (el, name) {
             return el.classList.remove(name);
+        },
+        
+        isContentEditable: function (el) {
+            return el.isContentEditable;
+        },
+        
+        isAttachedToDocument: function (el) {
+            return (document.compareDocumentPosition(el) & 1) === 0;
         }
     };
+    
+    // shims for broken and/or older browsers
+    if (!browserSetsIsContentEditablePropertyReliably())
+        useContentEditableAttribute();
+    
+    return domlib;
+    
+    // Element.isContentEditable is currently broken on Chrome.  It returns false for non-displayed elements. See https://code.google.com/p/chromium/issues/detail?id=313082 .
+    function browserSetsIsContentEditablePropertyReliably() {
+        var div = document.createElement("div");
+        div.innerHTML = '<div contentEditable="true"></div>';
+        return div.children[0].isContentEditable === true;
+    }
+    
+    function useContentEditableAttribute() {
+        domlib.isContentEditable = function (el) {
+            var contentEditable = el.getAttribute("contentEditable");
+            return contentEditable === "true" || contentEditable === "";
+        }
+    }
 });
 
 define('parse', [], function () {
@@ -2136,7 +1987,8 @@ define('parse', [], function () {
             "text"    : "svg",
             "polyline": "svg",
             "polygon" : "svg",
-            "line"    : "svg"
+            "line"    : "svg",
+            "path"    : "svg"
         };
 
     return function parse(html) {
@@ -2237,18 +2089,12 @@ define('Html', ['parse', 'cachedParse', 'domlib'], function (parse, cachedParse,
         property: function property(setter) {
             setter(this.node);
             return this;
-        }
-    };
-
-    Html.addDirective = function addDirective(name, fn) {
-        Html.prototype[name] = function directive(values) {
-            Html.runDirective(fn, this.node, values);
+        },
+        
+        mixin: function mixin(fn) {
+            fn()(this.node);
             return this;
-        };
-    };
-
-    Html.runDirective = function runDirective(fn, node, values) {
-        values(fn(node));
+        }
     };
 
     Html.cleanup = function (node, fn) {
@@ -2262,76 +2108,43 @@ define('Html', ['parse', 'cachedParse', 'domlib'], function (parse, cachedParse,
     return Html;
 });
 
-define('directives.attr', ['Html'], function (Html) {
-    Html.addDirective('attr', function (node) {
-        return function attr(name, value) {
-            node.setAttribute(name, value);
-        };
-    });
-});
+define('Html.insert', ['Html'], function (Html) {
+    var DOCUMENT_FRAGMENT_NODE = 11,
+        TEXT_NODE = 3;
+        
+    Html.prototype.insert = function insert(value) {
+        var node = this.node,
+            parent = node.parentNode,
+            start = marker(node),
+            cursor = start;
 
-define('directives.class', ['Html'], function (Html) {
-    Html.addDirective('class', function (node) {
-        if (node.className === undefined)
-            throw new Error("@class can only be applied to an element that accepts class names. \n"
-                + "Element ``" + node + "'' does not. Perhaps you applied it to the wrong node?");
+        return this.mixin(insert);
 
-        return function classDirective(on, off, flag) {
-            if (arguments.length < 3) flag = off, off = null;
-
-            var hasOn = Html.domlib.classListContains(node, on),
-                hasOff = off && Html.domlib.classListContains(node, off);
-
-            if (flag) {
-                if (!hasOn) Html.domlib.classListAdd(node, on);
-                if (off && hasOff) Html.domlib.classListRemove(node, off);
-            } else {
-                if (hasOn) Html.domlib.classListRemove(node, on);
-                if (off && !hasOff) Html.domlib.classListAdd(node, off);
-            }
-        };
-    });
-});
-
-define('directives.focus', ['Html'], function (Html) {
-    Html.addDirective('focus', function focus(node) {
-        return function focus(flag) {
-            flag ? node.focus() : node.blur();
-        };
-    });
-});
-
-define('directives.insert', ['Html'], function (Html) {
-
-    var DOCUMENT_FRAGMENT_NODE = 11;
-
-    Html.addDirective('insert', function (node) {
-        var parent,
-            start,
-            cursor;
-
-        return function insert(value) {
-            parent = node.parentNode;
-
-            if (!parent)
-                throw new Error("@insert can only be used on a node that has a parent node. \n"
-                    + "Node ``" + node + "'' is currently unattached to a parent.");
-
-            if (start) {
-                if (start.parentNode !== parent)
+        function insert() {
+            return function insert(node, state) {
+                parent = node.parentNode;
+    
+                if (!parent) {
+                    throw new Error("@insert can only be used on a node that has a parent node. \n"
+                        + "Node ``" + node + "'' is currently unattached to a parent.");
+                }
+                
+                if (start.parentNode !== parent) {
                     throw new Error("@insert requires that the inserted nodes remain sibilings \n"
                         + "of the original node.  The DOM has been modified such that this is \n"
                         + "no longer the case.");
-
-                //clear(start, node);
-            } else start = marker(node);
-
-            cursor = start;
-
-            insertValue(value);
-
-            clear(cursor, node);
-        };
+                }
+    
+                // set our cursor to the start of the insert range
+                cursor = start;
+    
+                // insert the current value
+                insertValue(value());
+    
+                // remove anything left after the cursor from the insert range
+                clear(cursor, node);
+            };
+        }
 
         // value ::
         //   null or undefined
@@ -2354,7 +2167,11 @@ define('directives.insert', ['Html'], function (Html) {
                 }
             } else if (value.nodeType /* instanceof Node */) {
                 if (next !== value) {
-                    parent.insertBefore(value, next);
+                    if (next.nextSibling === value && next !== value.nextSibling) {
+                        parent.removeChild(next);
+                    } else {
+                        parent.insertBefore(value, next);
+                    }
                 }
                 cursor = value;
             } else if (Array.isArray(value)) {
@@ -2362,9 +2179,12 @@ define('directives.insert', ['Html'], function (Html) {
             } else {
                 value = value.toString();
 
-                if (next.nodeType !== 3 || next.data !== value) {
+                if (next.nodeType !== TEXT_NODE) {
                     cursor = parent.insertBefore(document.createTextNode(value), next);
                 } else {
+                    if (next.data !== value) {
+                        next.data = value;
+                    }
                     cursor = next;
                 }
             }
@@ -2420,31 +2240,131 @@ define('directives.insert', ['Html'], function (Html) {
         function marker(el) {
             return parent.insertBefore(document.createTextNode(""), el);
         }
-    });
+    };
 });
 
-define('directives.onkey', ['Html'], function (Html) {
-    Html.addDirective('onkey', function (node) {
-        return function onkey(key, event, fn) {
-            if (arguments.length < 3) fn = event, event = 'down';
+define('Html.attr', ['Html'], function (Html) {
+    Html.attr = function attr(name, value) {
+        return function attr(node) {
+            node.setAttribute(name, value);
+        };
+    };
+});
 
-            var keyCode = keyCodes[key.toLowerCase()];
+define('Html.class', ['Html'], function (Html) {
+    Html.class = function classMixin(on, off, flag) {            
+        if (arguments.length < 3) flag = off, off = null;
+            
+        return function classMixin(node, state) {
+            if (node.className === undefined)
+                throw new Error("@class can only be applied to an element that accepts class names. \n"
+                    + "Element ``" + node + "'' does not. Perhaps you applied it to the wrong node?");
+                    
+            if (flag === state) return state;
 
-            if (keyCode === undefined)
-                throw new Error("@onkey: unrecognized key identifier '" + key + "'");
+            var hasOn = Html.domlib.classListContains(node, on),
+                hasOff = off && Html.domlib.classListContains(node, off);
 
-            if (typeof fn !== 'function')
-                throw new Error("@onkey: must supply a function to call when the key is entered");
+            if (flag) {
+                if (!hasOn) Html.domlib.classListAdd(node, on);
+                if (off && hasOff) Html.domlib.classListRemove(node, off);
+            } else {
+                if (hasOn) Html.domlib.classListRemove(node, on);
+                if (off && !hasOff) Html.domlib.classListAdd(node, off);
+            }
+            
+            return flag;
+        };
+    };
+});
 
-            Html.domlib.addEventListener(node, 'key' + event, onkeyListener);
-            Html.cleanup(node, function () { Html.domlib.removeEventListener(node, 'key' + event, onkeyListener); });
-
-            function onkeyListener(e) {
-                if (e.keyCode === keyCode) fn();
-                return true;
+define('Html.focus', ['Html'], function (Html) {
+    /**
+     * In htmlliterals, directives run when a node is created, meaning before it has usually
+     * been inserted into the document.  This causes a problem for the @focus directive, as only
+     * elements that are in the document (and visible) are focusable.  As a hack, we delay
+     * the focus event until the next animation frame, thereby giving htmlliterals a chance
+     * to get the node into the document.  If it isn't in by then (or if the user tried to focus
+     * a hidden node) then we give up.
+     */
+    var nodeToFocus = null,
+        startPos = NaN,
+        endPos = NaN,
+        scheduled = false;
+    
+    Html.focus = function focus(flag, start, end) {
+        start = arguments.length > 1 ? start : NaN;
+        end = arguments.length > 2 ? end : start;
+        
+        return function focus(node) {
+            if (!node.focus) {
+                throw new Error("@focus can only be applied to an element that has a .focus() method, like <input>, <select>, <textarea>, etc.");
+            }
+                
+            if (flag) {
+                nodeToFocus = node;
+                startPos = start;
+                endPos = end;
+                if (!scheduled) window.requestAnimationFrame(focuser);
+            } else {
+                node.blur();
             }
         };
-    });
+    };
+    
+    function focuser() {
+        scheduled = false;
+        
+        var start = startPos < 0 ? nodeToFocus.textContent.length + startPos + 1 : startPos,
+            end = endPos < 0 ? nodeToFocus.textContent.length + endPos + 1 : endPos,
+            range, sel;
+        
+        nodeToFocus.focus();
+        
+        if (!isNaN(start)) {
+            if (nodeToFocus.setSelectionRange) {
+                nodeToFocus.setSelectionRange(start, end);
+            } else if (nodeToFocus.createTextRange) {
+                range = nodeToFocus.createTextRange();
+                range.moveEnd('character', end);
+                range.moveStart('character', start);
+                range.select();
+            } else if (Html.domlib.isContentEditable(nodeToFocus) && nodeToFocus.childNodes.length > 0) {
+                range = document.createRange();
+                range.setStart(nodeToFocus.childNodes[0], start);
+                range.setEnd(nodeToFocus.childNodes[0], end);
+                sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+            }
+        }
+    }
+});
+
+define('Html.onkey', ['Html'], function (Html) {
+    Html.onkey = function onkey(key, event, fn) {
+        if (arguments.length < 3) fn = event, event = 'down';
+
+        var parts = key.toLowerCase().split('-', 2),
+            keyCode = keyCodes[parts[parts.length - 1]],
+            mod = parts.length > 1 ? parts[0] + "Key" : null;
+
+        if (keyCode === undefined)
+            throw new Error("@Html.onkey: unrecognized key identifier '" + key + "'");
+
+        if (typeof fn !== 'function')
+            throw new Error("@Html.onkey: must supply a function to call when the key is entered");
+            
+        return function (node) {
+            Html.domlib.addEventListener(node, 'key' + event, onkeyListener);
+            Html.cleanup(node, function () { Html.domlib.removeEventListener(node, 'key' + event, onkeyListener); });
+        };
+        
+        function onkeyListener(e) {
+            if (e.keyCode === keyCode && (!mod || e[mod])) fn(e);
+            return true;
+        }
+    };
 
     var keyCodes = {
         backspace:  8,
@@ -2550,9 +2470,11 @@ define('directives.onkey', ['Html'], function (Html) {
         define(['S', 'htmlliterals-runtime'], package); // AMD
     else package(S, Html); // globals
 })(function (S, Html) {
+    "use strict";
 
-    Html.runDirective = function runDirective(fn, node, values) {
-        fn = fn(node);
+    Html.prototype.mixin = function mixin(fn) {
+        var node = this.node,
+            state;
 
         //var logFn = function() {
         //    var args = Array.prototype.slice.call(arguments);
@@ -2560,14 +2482,12 @@ define('directives.onkey', ['Html'], function (Html) {
         //    fn.apply(undefined, args);
         //};
 
-        S(function updateDirective() {
+        S(function mixin() {
             //values(logFn);
-            values(fn);
+            state = fn()(node, state);
         });
-    };
-
-    Html.cleanup = function cleanup(node, fn) {
-        S.cleanup(fn);
+        
+        return this;
     };
 
     Html.prototype.property = function property(setter) {
@@ -2580,7 +2500,7 @@ define('directives.onkey', ['Html'], function (Html) {
         //    setter(node);
         //};
 
-        S(function updateProperty() {
+        S(function property() {
             //logSetter(node);
             setter(node);
         });
@@ -2588,30 +2508,35 @@ define('directives.onkey', ['Html'], function (Html) {
         return this;
     };
 
-    Html.addDirective('data', function (node) {
-        var signal = null,
-            tag = node.nodeName,
-            type = node.type && node.type.toUpperCase(),
-            handler =
-                tag === 'INPUT'         ? (
-                    type === 'TEXT'     ? valueData    :
-                    type === 'RADIO'    ? radioData    :
-                    type === 'CHECKBOX' ? checkboxData :
-                    null) :
-                tag === 'TEXTAREA'      ? valueData    :
-                tag === 'SELECT'        ? valueData    :
-                null;
-
-        if (!handler)
-            throw new Error("@signal can only be applied to a form control element, \n"
-                + "such as <input/>, <textarea/> or <select/>.  Element ``" + node + "'' is \n"
-                + "not a recognized control.  Perhaps you applied it to the wrong node?");
-
-        return handler();
-
-        function valueData() {
-            return function valueData(event, signal) {
-                if (arguments.length < 2) signal = event, event = 'change';
+    Html.cleanup = function cleanup(node, fn) {
+        S.cleanup(fn);
+    };
+    
+    Html.data = function(signal, arg1, arg2) {
+        return function (node) {
+            var tag = node.nodeName,
+                type = node.type && node.type.toUpperCase(),
+                handler =
+                    tag === 'INPUT'         ? (
+                        type === 'TEXT'                 ? valueData       :
+                        type === 'RADIO'                ? radioData       :
+                        type === 'CHECKBOX'             ? checkboxData    :
+                        null) :
+                    tag === 'TEXTAREA'                  ? valueData       :
+                    tag === 'SELECT'                    ? valueData       :
+                    Html.domlib.isContentEditable(node) ? textContentData :
+                    null;
+    
+            if (!handler)
+                throw new Error("@data can only be applied to a form control element, \n"
+                    + "such as <input/>, <textarea/> or <select/>, or to an element with "
+                    + "'contentEditable' set.  Element ``" + tag + "'' is \n"
+                    + "not such an element.  Perhaps you applied it to the wrong node?");
+    
+            return handler();
+    
+            function valueData() {
+                var event = arg1 || 'change';
 
                 S(function updateValue() {
                     node.value = signal();
@@ -2626,13 +2551,11 @@ define('directives.onkey', ['Html'], function (Html) {
                     if (cur.toString() !== update) signal(update);
                     return true;
                 }
-            };
-        }
-
-        function checkboxData() {
-            return function checkboxData(signal, on, off) {
-                on = on === undefined ? true : on;
-                off = off === undefined ? (on === true ? false : null) : off;
+            }
+    
+            function checkboxData() {
+                var on = arg1 === undefined ? true : arg1,
+                    off = arg2 === undefined ? (on === true ? false : null) : arg2;
 
                 S(function updateCheckbox() {
                     node.checked = (signal() === on);
@@ -2645,12 +2568,10 @@ define('directives.onkey', ['Html'], function (Html) {
                     signal(node.checked ? on : off);
                     return true;
                 }
-            };
-        }
-
-        function radioData() {
-            return function radioData(signal, on) {
-                on = on === undefined ? true : on;
+            }
+    
+            function radioData() {
+                var on = arg1 === undefined ? true : arg1;
 
                 S(function updateRadio() {
                     node.checked = (signal() === on);
@@ -2663,9 +2584,27 @@ define('directives.onkey', ['Html'], function (Html) {
                     if (node.checked) signal(on);
                     return true;
                 }
-            };
-        }
-    });
+            }
+            
+            function textContentData() {
+                var event = arg1 || 'input';
+
+                S(function updateTextContent() {
+                    node.textContent = signal();
+                });
+
+                Html.domlib.addEventListener(node, event, textContentListener);
+                S.cleanup(function () { Html.domlib.removeEventListener(node, event, textContentListener); });
+
+                function textContentListener() {
+                    var cur = S.peek(signal),
+                        update = node.textContent;
+                    if (cur.toString() !== update) signal(update);
+                    return true;
+                }
+            }
+        };
+    };
 });
 
 (function (package) {
