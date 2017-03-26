@@ -28,12 +28,10 @@
     <script type="text/javascript">
 
         function World(width, height) {
-            var w    = this,
-                _t = 0;
+            var w    = this;
 
             w.dt      = S.data(1 / 60);
-            w.t       = S.on(w.dt).S(() => _t += w.dt());
-            w.things  = S.array([]);
+            w.t       = S.on(w.dt, t => t + w.dt(), 0);
             w.width   = S.data(width);
             w.height  = S.data(height);
             w.running = S.data(false);
@@ -62,13 +60,10 @@
                 y > height ? y - height :
                 y;
 
-            w.makeCollisionSignal = function (X, Y) {
-                var hitters = w.things.filter(t => t instanceof X),
-                    hittees = w.things.filter(t => t instanceof Y);
-
-                return S(() => {
+            w.makeCollisionSignal = function (hitters, hittees) {
+                return S.on(w.dt, () => {
                     var collisions = [],
-                        xs = hitters().slice(),
+                        xs = hitters(),
                         ys = hittees(),
                         xlen = xs.length,
                         ylen = ys.length,
@@ -102,33 +97,31 @@
                     }
                     
                     return collisions;
-                });
+                }, []);
             }
         };
         
         function Thing(thing, w, radius) {
             thing.radius = S.data(radius);
-            w.things.push(thing);
-            S.cleanup(() => w.things.remove(thing));
         }
         
         function FreeFloating(thing, w, _) {
-            thing.vx = () => _.vx,
-            thing.vy = () => _.vy,
-            thing.x  = S.on(w.dt).S(() => _.x = w.topox(_.x + _.vx * w.dt()));
-            thing.y  = S.on(w.dt).S(() => _.y = w.topoy(_.y + _.vy * w.dt()));
+            thing.vx = () => _.vx;
+            thing.vy = () => _.vy;
+            thing.x  = S.on(w.dt, x => w.topox(x + _.vx * w.dt()), _.x);
+            thing.y  = S.on(w.dt, y => w.topoy(y + _.vy * w.dt()), _.y);
         }
         
         function Propelled(t, w, _) {
             t.F     = S.data(0);
             t.omega = S.data(0);
-            t.tau   = S.on(w.dt).S(() => _.tau += t.omega() * w.dt());
+            t.tau   = S.on(w.dt, tau => tau + t.omega() * w.dt(), _.tau);
             var a   = S(() => t.F() / _.m);
-            t.vx    = S.on(w.dt).S(() => _.vx -= a() * Math.sin(t.tau()) * w.dt());
-            t.vy    = S.on(w.dt).S(() => _.vy += a() * Math.cos(t.tau()) * w.dt());
+            t.vx    = S.on(w.dt, vx => vx - a() * Math.sin(t.tau()) * w.dt(), _.vx);
+            t.vy    = S.on(w.dt, vy => vy + a() * Math.cos(t.tau()) * w.dt(), _.vy);
             t.v     = S(() => Math.sqrt(t.vx() * t.vx() + t.vy() * t.vy()));
-            t.x     = S.on(w.dt).S(() => _.x = w.topox(_.x + t.vx() * w.dt()));
-            t.y     = S.on(w.dt).S(() => _.y = w.topoy(_.y + t.vy() * w.dt()));
+            t.x     = S.on(w.dt, x => w.topox(x + t.vx() * w.dt()), _.x);
+            t.y     = S.on(w.dt, y => w.topoy(y + t.vy() * w.dt()), _.y);
         }
 
         function rand(min, max) {
@@ -138,15 +131,15 @@
         }
 
         function Constructor(fn) {
-            var c = function (/* args */) {
-                var self = () => f(),
+            return function (/* args */) {
+                var self = this,
                     args = [].slice.call(arguments);
-                self.__proto__ = fn.prototype
-                var f = S.toplevel().on().S(() => fn.apply(self, args) || self);
-                return f();
+                S.root(dispose => {
+                    args.push(dispose);
+                    return S(() => S.sample(() => fn.apply(self, args))); 
+                });
+                return self;
             };
-            c.prototype = fn.prototype;
-            return c;
         }
 
         function dist(ax, ay, bx, by) {
@@ -165,28 +158,31 @@
                 this.ship = S.data(new Ship(this));
 
                 this.player = S.data(new Player(this));
+                
+                this.asteroids = SArray([]);
+                this.bullets = SArray([]);
 
-                new Asteroid(this, 40);
-                new Asteroid(this, 40);
-                new Asteroid(this, 40);
+                new Asteroid(this, 40, null);
+                new Asteroid(this, 40, null);
+                new Asteroid(this, 40, null);
 
                 this.lose = S(() => g.ships() === 0);
-                this.win = S(() => !g.things().some(t => t instanceof Asteroid));
+                this.win = S(() => g.asteroids().length === 0);
                 this.over = S(() => g.win() || g.lose());
                 this.paused = S(() => !g.over() && !g.running());
 
                 this.invincible = S.data(false);
 
-                var asteroidsHitShip = this.makeCollisionSignal(Asteroid, Ship);
-                var bulletsHitAsteroids = this.makeCollisionSignal(Bullet, Asteroid);
+                var asteroidsHitShip = this.makeCollisionSignal(this.asteroids, () => [ this.ship() ]);
+                var bulletsHitAsteroids = this.makeCollisionSignal(this.bullets, this.asteroids);
 
-                S.on(asteroidsHitShip).S(() => {
+                S.on(asteroidsHitShip, () => {
                     if (asteroidsHitShip().length === 0 || g.invincible()) return;
                     g.ship().destroyed(true);
                     g.running(false);
                 });
 
-                S.on(bulletsHitAsteroids).S(() => {
+                S.on(bulletsHitAsteroids, () => {
                     var hits = bulletsHitAsteroids(),
                         i, len, b, a;
                         
@@ -198,20 +194,28 @@
                         a.destroyed(true);
     
                         if (a.radius() > 5) {
-                            new Asteroid(g, Math.round(a.radius() / 3), a);
-                            new Asteroid(g, Math.round(a.radius() / 3), a);
-                            new Asteroid(g, Math.round(a.radius() / 3), a);
+                            new Asteroid(g, Math.round(a.radius() / 3), b);
+                            new Asteroid(g, Math.round(a.radius() / 3), b);
+                            new Asteroid(g, Math.round(a.radius() / 3), b);
                         }
     
-                        S.dispose(b);
-                        S.dispose(a);
+                        a.dispose();
+                        b.dispose();
+                    }
+                });
+
+                S.on(g.t, () => {
+                    var t = g.t(),
+                        bullets = g.bullets();
+                    for (var i = 0, len = bullets.length; i < len; i++) {
+                        if (bullets[i].t < t) bullets[i].dispose();
                     }
                 });
 
                 this.start = function () {
                     if (g.over()) return;
                     if (g.ship().destroyed()) {
-                        S.dispose(g.ship());
+                        g.ship().dispose();
                         g.ships(g.ships() - 1);
                         if (g.ships() > 0) g.ship(new Ship(g));
                     }
@@ -226,14 +230,14 @@
                 this.stopTurning = () => w.ship().omega(0);
                 this.fire        = () => new Bullet(w, w.ship().tau(), w.ship());
                 this.pause       = () => w.running(false);
-                this.bench       = () => S.event(() => {
+                this.bench       = () => S.freeze(() => {
                     w.invincible(true);
                     for (var i = 0; i < 1000; i++) {
                         var a = new Bullet(w, Math.PI * 2 * i / 1000, w.ship());
                     }
                 })
             }),
-            Ship = Constructor(function (w) {
+            Ship = Constructor(function (w, dispose) {
                 Thing(this, w, 10);
                 Propelled(this, w, { 
                     x:   w.width() / 2, 
@@ -245,8 +249,9 @@
                 });
 
                 this.destroyed = S.data(false);
+                this.dispose = dispose;
             }),
-            Asteroid = Constructor(function (w, size, parent) {
+            Asteroid = Constructor(function (w, size, parent, dispose) {
                 Thing(this, w, size);
 
                 var v = rand(10, 60 - size),
@@ -274,14 +279,19 @@
                 });
                 
                 this.destroyed = S.data(false);
+                this.dispose = dispose;
+                
+                w.asteroids.push(this);
+                S.cleanup(() => w.asteroids.remove(this));
             }),
-            Bullet = Constructor(function (w, tau, firer) {
+            Bullet = Constructor(function (w, tau, firer, dispose) {
                 var v = 200,
                     sin = Math.sin(tau),
                     cos = Math.cos(tau),
                     vx = -sin * v + firer.vx(),
                     vy = cos * v + firer.vy(),
                     t = w.t() + (Math.abs(sin) * w.width() + Math.abs(cos) * w.height()) * 0.8 / (v + firer.v());
+                    //t = w.t() + Math.min(w.width(), w.height()) * 0.8 / v;
 
                 Thing(this, w, 1);
                 FreeFloating(this, w, {
@@ -290,8 +300,12 @@
                     vx: vx, 
                     vy: vy
                 });
+                
+                this.t = t;
+                this.dispose = dispose;
 
-                S(() => { if (w.t() > t) S.dispose(this); });
+                w.bullets.push(this);
+                S.cleanup(() => w.bullets.remove(this));
             }),
             attr = Html.attr,
             onkey = Html.onkey,
@@ -380,56 +394,66 @@
                 ctx.strokeStyle = "white";
                 ctx.fillStyle = "white";
 
-                S.on(g.dt).S(() => {
+                S.on(g.dt, redraw);
+                
+                function redraw() {
                     ctx.clearRect(0, 0, g.width(), g.height());
 
                     ctx.beginPath();
 
-                    var things = g.things(), i, t;
+                    var bullets = g.bullets(), 
+                        asteroids = g.asteroids(), 
+                        i, t;
 
-                    for (i = 0; i < things.length; i++) {
-                        t = things[i];
-
-                        if (t instanceof Ship) {
-                            ctx.save();
-                            ctx.translate(t.x(), t.y());
-                            ctx.rotate(t.tau());
-                            ctx.moveTo(-10, -6);
-                            ctx.lineTo(0, 20);
-                            ctx.lineTo(10, -6);
-                            ctx.lineTo(6, -2);
-                            ctx.lineTo(-6, -2);
-                            ctx.lineTo(-10, -6);
-                            if (t.F()) {
-                                ctx.moveTo(2, -2);
-                                ctx.lineTo(4, -20);
-                                ctx.moveTo(-2, -2);
-                                ctx.lineTo(-4, -20);
-                            }
-                            if (t.omega() > 0) {
-                                ctx.moveTo(4, 14);
-                                ctx.lineTo(14, 14);
-                            } else if (t.omega() < 0) {
-                                ctx.moveTo(-4, 14);
-                                ctx.lineTo(-14, 14);
-                            }
-                            ctx.restore();
-                        } else if (t instanceof Bullet) {
-                            ctx.moveTo(t.x(), t.y());
-                            ctx.lineTo(t.x() + t.vx() * 0.04, t.y() + t.vy() * 0.04);
-                        } else if (t instanceof Asteroid) {
-                            ctx.moveTo(t.x() + t.radius(), t.y());
-                            ctx.arc(t.x(), t.y(), t.radius(), 0,  Math.PI * 2, false);
-                        }
+                    for (i = 0; i < bullets.length; i++) {
+                        t = bullets[i];
+                        
+                        ctx.moveTo(t.x(), t.y());
+                        ctx.lineTo(t.x() + t.vx() * 0.04, t.y() + t.vy() * 0.04);
                     }
+
+                    for (i = 0; i < asteroids.length; i++) {
+                        t = asteroids[i];
+                        
+                        ctx.moveTo(t.x() + t.radius(), t.y());
+                        ctx.arc(t.x(), t.y(), t.radius(), 0,  Math.PI * 2, false);
+                    }
+                    
+                    t = g.ship();
+                        
+                    ctx.save();
+                    ctx.translate(t.x(), t.y());
+                    ctx.rotate(t.tau());
+                    ctx.moveTo(-10, -6);
+                    ctx.lineTo(0, 20);
+                    ctx.lineTo(10, -6);
+                    ctx.lineTo(6, -2);
+                    ctx.lineTo(-6, -2);
+                    ctx.lineTo(-10, -6);
+                    if (t.F()) {
+                        ctx.moveTo(2, -2);
+                        ctx.lineTo(4, -20);
+                        ctx.moveTo(-2, -2);
+                        ctx.lineTo(-4, -20);
+                    }
+                    if (t.omega() > 0) {
+                        ctx.moveTo(4, 14);
+                        ctx.lineTo(14, 14);
+                    } else if (t.omega() < 0) {
+                        ctx.moveTo(-4, 14);
+                        ctx.lineTo(-14, 14);
+                    }
+                    ctx.restore();
                     
                     ctx.closePath();
                     
                     ctx.stroke();
 
+                    var things = asteroids.length + bullets.length + 1;
+
                     ctx.fillText("fps:", 0, 20);       ctx.fillText(g.fps().toFixed(0), 75, 20);
-                    ctx.fillText("objects:", 0, 40);   ctx.fillText(things.length, 75, 40);
-                    ctx.fillText("objs/s:", 0, 60);    ctx.fillText((g.fps() * things.length).toFixed(0), 75, 60);
+                    ctx.fillText("objects:", 0, 40);   ctx.fillText(things, 75, 40);
+                    ctx.fillText("objs/s:", 0, 60);    ctx.fillText((g.fps() * things).toFixed(0), 75, 60);
 
                     var msg = g.paused() ? "-- hit space to start --" :
                               g.lose()   ? "-- game over --" :
@@ -437,14 +461,17 @@
                               null;
 
                     if (msg) ctx.fillText(msg, (g.width() - ctx.measureText(msg).width) / 2, g.height() / 2 + 40);
-                });
+                }
 
                 return canvas;
-            },
-            game = new Game(),
+            };
+
+        S.root(function () {
+            game = new Game();
             view = S(() => CanvasView(game));
 
-        document.body.appendChild(view());
+            document.body.appendChild(view());
+        });
     </script>
     <script type="text/javascript" src="../dist/surplus.js"></script>
 </body>

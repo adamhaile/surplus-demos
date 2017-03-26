@@ -5,7 +5,8 @@ var gulp = require('gulp'),
 
 var srcs = [
         "../S/dist/S.js",
-        "../S-array/src/S.array.js",
+        "../S-array/SArray.js",
+        //"../S-json/S.json.js",
         "../htmlliterals-preprocessor/dist/htmlliterals-preprocessor.js",
         "../htmlliterals-runtime/dist/htmlliterals-runtime.js",
         "../S-htmlliterals/src/S-htmlliterals.js",
@@ -13,10 +14,16 @@ var srcs = [
     ],
     runtime = [
         "../S/dist/S.js",
-        "../S-array/src/S.array.js",
+        "../S-array/SArray.js",
+        //"../S-json/S.json.js",
         "../htmlliterals-runtime/dist/htmlliterals-runtime.js",
         "../S-htmlliterals/src/S-htmlliterals.js",
         "src/bootstrap.js"
+    ],
+    srcdts = [
+        "../S/S.d.ts",
+        "../S-array/S.array.d.ts",
+        "../htmlliterals-runtime/htmlliterals.d.ts"
     ];
 
 gulp.task('dist', function() {
@@ -32,6 +39,10 @@ gulp.task('dist', function() {
     .pipe(gulp.dest("dist"))
     .pipe(rename("surplus-runtime.min.js"))
     .pipe(uglify())
+    .pipe(gulp.dest("dist"));
+
+    gulp.src(srcdts)
+    .pipe(concat("surplus.d.ts"))
     .pipe(gulp.dest("dist"));
 });
 

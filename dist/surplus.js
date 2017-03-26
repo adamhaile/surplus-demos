@@ -1,592 +1,593 @@
 /// <reference path="../S.d.ts" />
 (function () {
     "use strict";
-    // "Globals" used to keep track of current system state
-    var Time = 1, // our clock, ticks every update
-    Batching = 0, // whether we're batching data changes, 0 = no, 1+ = yes, with index to next Batch slot
-    Batch = [], // batched changes to data nodes
-    Updating = null, // whether we're updating, null = no, non-null = node being updated
-    Sampling = false, // whether we're sampling signals, with no dependencies
-    Disposing = false, // whether we're disposing
-    Disposes = []; // disposals to run after current batch of changes finishes 
-    var S = function S(fn, options) {
-        var parent = Updating, gate = (options && options.async && Gate(options.async)) || (parent && parent.gate) || null, node = new ComputationNode(fn, gate);
-        if (parent && (!options || !options.toplevel)) {
-            (parent.children || (parent.children = [])).push(node);
-        }
-        Updating = node;
-        if (Batching) {
-            node.value = fn();
+    // Public interface
+    var S = function S(fn, seed) {
+        var owner = Owner, clock = RunningClock || RootClock, running = RunningNode;
+        if (!owner)
+            throw new Error("all computations must be created under a parent computation or root");
+        var node = new ComputationNode(clock, fn, seed);
+        Owner = RunningNode = node;
+        if (RunningClock) {
+            node.value = node.fn(node.value);
         }
         else {
-            node.value = initialExecution(node, fn);
+            toplevelComputation(node);
         }
-        Updating = parent;
+        if (owner !== UNOWNED)
+            (owner.owned || (owner.owned = [])).push(node);
+        Owner = owner;
+        RunningNode = running;
         return function computation() {
-            if (Disposing) {
-                if (Batching)
-                    Disposes.push(node);
-                else
-                    node.dispose();
-            }
-            else if (Updating && node.fn) {
-                if (node.receiver && node.receiver.marks !== 0 && node.receiver.age === Time) {
-                    backtrack(node.receiver);
+            if (RunningNode) {
+                var rclock = RunningClock, sclock = node.clock;
+                while (rclock.depth > sclock.depth + 1)
+                    rclock = rclock.parent;
+                if (rclock === sclock || rclock.parent === sclock) {
+                    if (node.preclocks) {
+                        for (var i = 0; i < node.preclocks.count; i++) {
+                            var preclock = node.preclocks.clocks[i];
+                            updateClock(preclock);
+                        }
+                    }
+                    if (node.age === node.clock.time()) {
+                        if (node.state === RUNNING)
+                            throw new Error("circular dependency");
+                        else
+                            updateNode(node); // checks for state === STALE internally, so don't need to check here
+                    }
+                    if (node.preclocks) {
+                        for (var i = 0; i < node.preclocks.count; i++) {
+                            var preclock = node.preclocks.clocks[i];
+                            if (rclock === sclock)
+                                logNodePreClock(preclock, RunningNode);
+                            else
+                                logClockPreClock(preclock, rclock, RunningNode);
+                        }
+                    }
                 }
-                if (!Sampling) {
-                    if (!node.emitter)
-                        node.emitter = new Emitter(node);
-                    addEdge(node.emitter, Updating);
+                else {
+                    if (rclock.depth > sclock.depth)
+                        rclock = rclock.parent;
+                    while (sclock.depth > rclock.depth + 1)
+                        sclock = sclock.parent;
+                    if (sclock.parent === rclock) {
+                        logNodePreClock(sclock, RunningNode);
+                    }
+                    else {
+                        if (sclock.depth > rclock.depth)
+                            sclock = sclock.parent;
+                        while (rclock.parent !== sclock.parent)
+                            rclock = rclock.parent, sclock = sclock.parent;
+                        logClockPreClock(sclock, rclock, RunningNode);
+                    }
+                    updateClock(sclock);
                 }
+                logComputationRead(node, RunningNode);
             }
             return node.value;
         };
     };
-    function initialExecution(node, fn) {
-        var result;
-        Time++;
-        Batching = 1;
+    S.root = function root(fn) {
+        var owner = Owner, root = fn.length === 0 ? UNOWNED : new ComputationNode(RunningClock || RootClock, null, null), result = undefined;
+        Owner = root;
         try {
-            result = fn();
-            if (Batching > 1)
-                resolve(null);
+            result = fn.length === 0 ? fn() : fn(function _dispose() {
+                if (RunningClock) {
+                    markClockStale(root.clock);
+                    root.clock.disposes.add(root);
+                }
+                else {
+                    dispose(root);
+                }
+            });
         }
         finally {
-            Updating = null;
-            Batching = 0;
+            Owner = owner;
         }
         return result;
+    };
+    S.on = function on(ev, fn, seed, onchanges) {
+        if (Array.isArray(ev))
+            ev = callAll(ev);
+        onchanges = !!onchanges;
+        return S(on, seed);
+        function on(value) {
+            var running = RunningNode;
+            ev();
+            if (onchanges)
+                onchanges = false;
+            else {
+                RunningNode = null;
+                value = fn(value);
+                RunningNode = running;
+            }
+            return value;
+        }
+    };
+    function callAll(ss) {
+        return function all() {
+            for (var i = 0; i < ss.length; i++)
+                ss[i]();
+        };
     }
     S.data = function data(value) {
-        var node = new DataNode(value);
+        var node = new DataNode(RunningClock || RootClock, value);
         return function data(value) {
+            var rclock = RunningClock, sclock = node.clock;
+            if (RunningClock) {
+                while (rclock.depth > sclock.depth)
+                    rclock = rclock.parent;
+                while (sclock.depth > rclock.depth && sclock.parent !== rclock)
+                    sclock = sclock.parent;
+                if (sclock.parent !== rclock)
+                    while (rclock.parent !== sclock.parent)
+                        rclock = rclock.parent, sclock = sclock.parent;
+                if (rclock !== sclock) {
+                    updateClock(sclock);
+                }
+            }
+            var cclock = rclock === sclock ? sclock : sclock.parent;
             if (arguments.length > 0) {
-                if (Batching) {
-                    if (node.age === Time) {
+                if (RunningClock) {
+                    if (node.pending !== NOTPENDING) {
                         if (value !== node.pending) {
                             throw new Error("conflicting changes: " + value + " !== " + node.pending);
                         }
                     }
                     else {
-                        node.age = Time;
+                        markClockStale(cclock);
                         node.pending = value;
-                        Batch[Batching++] = node;
+                        cclock.changes.add(node);
                     }
                 }
                 else {
-                    node.age = Time;
-                    node.value = value;
-                    if (node.emitter)
-                        handleEvent(node);
-                }
-                return value;
-            }
-            else {
-                if (Updating && !Sampling) {
-                    if (!node.emitter)
-                        node.emitter = new Emitter(null);
-                    addEdge(node.emitter, Updating);
-                }
-                return node.value;
-            }
-        };
-    };
-    S.sum = function sum(value) {
-        var node = new DataNode(value);
-        return function sum(update) {
-            if (arguments.length > 0) {
-                if (Batching) {
-                    if (node.age === Time) {
-                        node.pending = update(node.pending);
+                    if (node.log) {
+                        node.pending = value;
+                        RootClock.changes.add(node);
+                        event();
                     }
                     else {
-                        node.age = Time;
-                        node.pending = update(node.value);
-                        Batch[Batching++] = node;
+                        node.value = value;
                     }
-                }
-                else {
-                    node.age = Time;
-                    node.value = update(node.value);
-                    if (node.emitter)
-                        handleEvent(node);
                 }
                 return value;
             }
             else {
-                if (Updating && !Sampling) {
-                    if (!node.emitter)
-                        node.emitter = new Emitter(null);
-                    addEdge(node.emitter, Updating);
+                if (RunningNode) {
+                    logDataRead(node, RunningNode);
+                    if (sclock.parent === rclock)
+                        logNodePreClock(sclock, RunningNode);
+                    else if (sclock !== rclock)
+                        logClockPreClock(sclock, rclock, RunningNode);
                 }
                 return node.value;
             }
         };
     };
-    S.on = function on(ev, fn, seed, options) {
-        var first = true;
-        return S(on, options);
-        function on() { typeof ev === 'function' ? ev() : multi(); first ? first = false : S.sample(next); return seed; }
-        function next() { seed = fn(seed); }
-        function multi() { for (var i = 0; i < ev.length; i++)
-            ev[i](); }
-    };
-    function Gate(scheduler) {
-        var root = new DataNode(null), scheduled = false, gotime = 0, tick;
-        root.emitter = new Emitter(null);
-        return function gate(node) {
-            if (gotime === Time)
-                return true;
-            if (typeof tick === 'function')
-                tick();
-            else if (!scheduled) {
-                scheduled = true;
-                tick = scheduler(go);
-            }
-            addEdge(root.emitter, node);
-            return false;
-        };
-        function go() {
-            if (gotime === Time)
-                return;
-            scheduled = false;
-            gotime = Time + 1;
-            if (Batching) {
-                Batch[Batching++] = root;
+    S.value = function value(current, eq) {
+        var data = S.data(current), clock = RunningClock || RootClock, age = 0;
+        return function value(update) {
+            if (arguments.length === 0) {
+                return data();
             }
             else {
-                handleEvent(root);
+                var same = eq ? eq(current, update) : current === update;
+                if (!same) {
+                    var time = clock.time();
+                    if (age === time)
+                        throw new Error("conflicting values: " + value + " is not the same as " + current);
+                    age = time;
+                    current = update;
+                    data(update);
+                }
+                return update;
             }
-        }
-    }
-    ;
-    S.event = function event(fn) {
-        var result;
-        if (Batching) {
+        };
+    };
+    S.freeze = function freeze(fn) {
+        var result = undefined;
+        if (RunningClock) {
             result = fn();
         }
         else {
-            Batching = 1;
+            RunningClock = RootClock;
+            RunningClock.changes.reset();
             try {
                 result = fn();
-                handleEvent(null);
+                event();
             }
             finally {
-                Batching = 0;
+                RunningClock = null;
             }
         }
         return result;
     };
     S.sample = function sample(fn) {
-        var result;
-        if (Updating && !Sampling) {
-            Sampling = true;
+        var result, running = RunningNode;
+        if (running) {
+            RunningNode = null;
             result = fn();
-            Sampling = false;
+            RunningNode = running;
         }
         else {
             result = fn();
         }
         return result;
     };
-    S.dispose = function dispose(signal) {
-        if (Disposing) {
-            signal();
-        }
-        else {
-            Disposing = true;
-            try {
-                signal();
-            }
-            finally {
-                Disposing = false;
-            }
-        }
-    };
     S.cleanup = function cleanup(fn) {
-        if (Updating) {
-            (Updating.cleanups || (Updating.cleanups = [])).push(fn);
+        if (Owner) {
+            (Owner.cleanups || (Owner.cleanups = [])).push(fn);
         }
         else {
             throw new Error("S.cleanup() must be called from within an S() computation.  Cannot call it at toplevel.");
         }
     };
-    function handleEvent(change) {
-        try {
-            resolve(change);
+    S.subclock = function subclock(fn) {
+        var clock = new Clock(RunningClock || RootClock);
+        return fn ? subclock(fn) : subclock;
+        function subclock(fn) {
+            var result = null, running = RunningClock;
+            RunningClock = clock;
+            clock.state = STALE;
+            try {
+                result = fn();
+                clock.subtime++;
+                run(clock);
+            }
+            finally {
+                RunningClock = running;
+            }
+            return result;
         }
-        finally {
-            Batching = 0;
-            Updating = null;
-            Sampling = false;
-            Disposing = false;
-        }
-    }
-    var _batch = [];
-    function resolve(change) {
-        var count = 0, batch, i, len;
-        if (!Batching)
-            Batching = 1;
-        if (change) {
-            Time++;
-            prepare(change.emitter);
-            notify(change.emitter);
-            i = -1, len = Disposes.length;
-            if (len) {
-                while (++i < len)
-                    Disposes[i].dispose();
-                Disposes = [];
-            }
-        }
-        // for each batch ...
-        while (Batching !== 1) {
-            // prepare globals to record next batch
-            Time++;
-            batch = Batch, Batch = _batch, _batch = batch; // rotate batch arrays
-            len = Batching, Batching = 1;
-            // set nodes' values, clear pending data, and prepare them for update
-            i = 0;
-            while (++i < len) {
-                change = batch[i];
-                change.value = change.pending;
-                change.pending = undefined;
-                if (change.emitter)
-                    prepare(change.emitter);
-            }
-            // run all updates in batch
-            i = 0;
-            while (++i < len) {
-                change = batch[i];
-                if (change.emitter)
-                    notify(change.emitter);
-                batch[i] = null;
-            }
-            // run disposes accumulated while updating
-            i = -1, len = Disposes.length;
-            if (len) {
-                while (++i < len)
-                    Disposes[i].dispose();
-                Disposes = [];
-            }
-            // if there are still changes after excessive batches, assume runaway            
-            if (count++ > 1e5) {
-                throw new Error("Runaway frames detected");
-            }
-        }
-    }
-    /// mark the node and all downstream nodes as within the range to be updated
-    function prepare(emitter) {
-        var edges = emitter.edges, i = -1, len = edges.length, edge, to, node, toEmitter;
-        emitter.emitting = true;
-        while (++i < len) {
-            edge = edges[i];
-            if (edge && (!edge.boundary || edge.to.node.gate(edge.to.node))) {
-                to = edge.to;
-                node = to.node;
-                toEmitter = node.emitter;
-                // if an earlier update threw an exception, marks may be dirty - clear it now
-                if (to.marks !== 0 && to.age < Time) {
-                    to.marks = 0;
-                    if (toEmitter)
-                        toEmitter.emitting = false;
-                }
-                // if we've come back to an emitting Emitter, that's a cycle
-                if (toEmitter && toEmitter.emitting)
-                    throw new Error("circular dependency"); // TODO: more helpful reporting
-                edge.marked = true;
-                to.marks++;
-                to.age = Time;
-                // if this is the first time to's been marked, then prepare children propagate
-                if (to.marks === 1) {
-                    if (node.children)
-                        prepareChildren(node.children);
-                    if (toEmitter)
-                        prepare(toEmitter);
-                }
-            }
-        }
-        emitter.emitting = false;
-    }
-    function prepareChildren(children) {
-        var i = -1, len = children.length, child;
-        while (++i < len) {
-            child = children[i];
-            child.fn = null;
-            if (child.children)
-                prepareChildren(child.children);
-        }
-    }
-    function notify(emitter) {
-        var i = -1, len = emitter.edges.length, edge, to;
-        while (++i < len) {
-            edge = emitter.edges[i];
-            if (edge && edge.marked) {
-                to = edge.to;
-                edge.marked = false;
-                to.marks--;
-                if (to.marks === 0) {
-                    update(to.node);
-                }
-            }
-        }
-        if (emitter.fragmented())
-            emitter.compact();
-    }
-    /// update the given node by re-executing any payload, updating inbound links, then updating all downstream nodes
-    function update(node) {
-        var emitter = node.emitter, receiver = node.receiver, disposing = node.fn === null, i, len, edge, to;
-        Updating = node;
-        disposeChildren(node);
-        node.cleanup(disposing);
-        if (!disposing)
-            node.value = node.fn();
-        if (emitter) {
-            // this is the content of notify(emitter), inserted to shorten call stack for ergonomics
-            i = -1, len = emitter.edges.length;
-            while (++i < len) {
-                edge = emitter.edges[i];
-                if (edge && edge.marked) {
-                    to = edge.to;
-                    edge.marked = false;
-                    to.marks--;
-                    if (to.marks === 0) {
-                        update(to.node);
-                    }
-                }
-            }
-            if (disposing) {
-                emitter.detach();
-            }
-            else if (emitter.fragmented())
-                emitter.compact();
-        }
-        if (receiver) {
-            if (disposing) {
-                receiver.detach();
+    };
+    // Internal implementation
+    /// Graph classes and operations
+    var Clock = (function () {
+        function Clock(parent) {
+            this.parent = parent;
+            this.id = Clock.count++;
+            this.state = CURRENT;
+            this.subtime = 0;
+            this.preclocks = null;
+            this.changes = new Queue(); // batched changes to data nodes
+            this.subclocks = new Queue(); // subclocks that need to be updated
+            this.updates = new Queue(); // computations to update
+            this.disposes = new Queue(); // disposals to run after current batch of updates finishes
+            if (parent) {
+                this.age = parent.time();
+                this.depth = parent.depth + 1;
             }
             else {
-                i = -1, len = receiver.edges.length;
-                while (++i < len) {
-                    edge = receiver.edges[i];
-                    if (edge.active && edge.age < Time) {
-                        edge.deactivate();
-                    }
-                }
-                if (receiver.fragmented())
-                    receiver.compact();
+                this.age = 0;
+                this.depth = 0;
             }
         }
-    }
-    function disposeChildren(node) {
-        if (!node.children)
-            return;
-        var i = -1, len = node.children.length, child;
-        while (++i < len) {
-            child = node.children[i];
-            if (!child.receiver || child.receiver.age < Time) {
-                disposeChildren(child);
-                child.dispose();
-            }
-        }
-        node.children = null;
-    }
-    /// update the given node by backtracking its dependencies to clean state and updating from there
-    function backtrack(receiver) {
-        var updating = Updating, sampling = Sampling;
-        backtrack(receiver);
-        Updating = updating;
-        Sampling = sampling;
-        function backtrack(receiver) {
-            var i = -1, len = receiver.edges.length, edge;
-            while (++i < len) {
-                edge = receiver.edges[i];
-                if (edge && edge.marked) {
-                    if (edge.from.node && edge.from.node.receiver.marks) {
-                        // keep working backwards through the marked nodes ...
-                        backtrack(edge.from.node.receiver);
-                    }
-                    else {
-                        // ... until we find clean state, from which to start updating
-                        notify(edge.from);
-                    }
-                }
-            }
-        }
-    }
-    /// Graph classes and operations
+        Clock.prototype.time = function () {
+            var time = this.subtime, p = this;
+            while (p = p.parent)
+                time += p.subtime;
+            return time;
+        };
+        return Clock;
+    }());
+    Clock.count = 0;
     var DataNode = (function () {
-        function DataNode(value) {
+        function DataNode(clock, value) {
+            this.clock = clock;
             this.value = value;
-            this.age = 0; // Data nodes start at a time prior to the present, or else they can't be set in the current frame
-            this.emitter = null;
+            this.pending = NOTPENDING;
+            this.log = null;
         }
         return DataNode;
-    })();
+    }());
     var ComputationNode = (function () {
-        function ComputationNode(fn, gate) {
+        function ComputationNode(clock, fn, value) {
+            this.clock = clock;
             this.fn = fn;
-            this.gate = gate;
-            this.emitter = null;
-            this.receiver = null;
-            // children and cleanups generated by last update
-            this.children = null;
+            this.value = value;
+            this.state = CURRENT;
+            this.count = 0;
+            this.sources = [];
+            this.sourceslots = [];
+            this.log = null;
+            this.preclocks = null;
+            this.owned = null;
             this.cleanups = null;
+            this.age = this.clock.time();
         }
-        // dispose node: free memory, dispose children, cleanup, detach from graph
-        ComputationNode.prototype.dispose = function () {
-            if (!this.fn)
-                return;
-            this.fn = null;
-            this.gate = null;
-            if (this.children) {
-                var i = -1, len = this.children.length;
-                while (++i < len) {
-                    this.children[i].dispose();
-                }
-            }
-            this.cleanup(true);
-            if (this.receiver)
-                this.receiver.detach();
-            if (this.emitter)
-                this.emitter.detach();
-        };
-        ComputationNode.prototype.cleanup = function (final) {
-            if (this.cleanups) {
-                var i = -1, len = this.cleanups.length;
-                while (++i < len) {
-                    this.cleanups[i](final);
-                }
-                this.cleanups = null;
-            }
-        };
         return ComputationNode;
-    })();
-    var Emitter = (function () {
-        function Emitter(node) {
-            this.node = node;
-            this.id = Emitter.count++;
-            this.emitting = false;
-            this.edges = [];
-            this.index = [];
-            this.active = 0;
-            this.edgesAge = 0;
+    }());
+    var Log = (function () {
+        function Log() {
+            this.count = 0;
+            this.nodes = [];
+            this.nodeslots = [];
+            this.freecount = 0;
+            this.freeslots = [];
         }
-        Emitter.prototype.detach = function () {
-            var i = -1, len = this.edges.length, edge;
-            while (++i < len) {
-                edge = this.edges[i];
-                if (edge)
-                    edge.deactivate();
+        return Log;
+    }());
+    var NodePreClockLog = (function () {
+        function NodePreClockLog() {
+            this.count = 0;
+            this.clocks = []; // [clock], where clock.parent === node.clock
+            this.ages = []; // clock.id -> node.age
+            this.ucount = 0; // number of ancestor clocks with preclocks from this node
+            this.uclocks = [];
+            this.uclockids = [];
+        }
+        return NodePreClockLog;
+    }());
+    var ClockPreClockLog = (function () {
+        function ClockPreClockLog() {
+            this.count = 0;
+            this.clockcounts = []; // clock.id -> ref count
+            this.clocks = []; // clock.id -> clock 
+            this.ids = []; // [clock.id]
+        }
+        return ClockPreClockLog;
+    }());
+    var Queue = (function () {
+        function Queue() {
+            this.items = [];
+            this.count = 0;
+        }
+        Queue.prototype.reset = function () {
+            this.count = 0;
+        };
+        Queue.prototype.add = function (item) {
+            this.items[this.count++] = item;
+        };
+        Queue.prototype.run = function (fn) {
+            var items = this.items;
+            for (var i = 0; i < this.count; i++) {
+                fn(items[i]);
+                items[i] = null;
             }
+            this.count = 0;
         };
-        Emitter.prototype.fragmented = function () {
-            return this.edges.length > 10 && this.edges.length / this.active > 4;
-        };
-        Emitter.prototype.compact = function () {
-            var i = -1, len = this.edges.length, edges = [], compaction = ++this.edgesAge, edge;
-            while (++i < len) {
-                edge = this.edges[i];
-                if (edge) {
-                    edge.slot = edges.length;
-                    edge.slotAge = compaction;
-                    edges.push(edge);
-                }
-            }
-            this.edges = edges;
-        };
-        Emitter.count = 0;
-        return Emitter;
-    })();
-    function addEdge(from, to) {
-        var edge = null;
-        if (!to.receiver)
-            to.receiver = new Receiver(to);
-        else
-            edge = to.receiver.index[from.id];
-        if (edge)
-            edge.activate(from);
-        else
-            new Edge(from, to.receiver, to.gate && (from.node === null || to.gate !== from.node.gate));
+        return Queue;
+    }());
+    // Constants
+    var NOTPENDING = {}, CURRENT = 0, STALE = 1, RUNNING = 2;
+    // "Globals" used to keep track of current system state
+    var RootClock = new Clock(null), RunningClock = null, // currently running clock 
+    RunningNode = null, // currently running computation
+    Owner = null; // owner for new computations
+    // Constants
+    var UNOWNED = new ComputationNode(RootClock, null, null);
+    // Functions
+    function logRead(from, to) {
+        var fromslot = from.freecount ? from.freeslots[--from.freecount] : from.count++, toslot = to.count++;
+        from.nodes[fromslot] = to;
+        from.nodeslots[fromslot] = toslot;
+        to.sources[toslot] = from;
+        to.sourceslots[toslot] = fromslot;
     }
-    var Receiver = (function () {
-        function Receiver(node) {
-            this.node = node;
-            this.id = Emitter.count++;
-            this.marks = 0;
-            this.age = Time;
-            this.edges = [];
-            this.index = [];
-            this.active = 0;
+    function logDataRead(data, to) {
+        if (!data.log)
+            data.log = new Log();
+        logRead(data.log, to);
+    }
+    function logComputationRead(node, to) {
+        if (!node.log)
+            node.log = new Log();
+        logRead(node.log, to);
+    }
+    function logNodePreClock(clock, to) {
+        if (!to.preclocks)
+            to.preclocks = new NodePreClockLog();
+        else if (to.preclocks.ages[clock.id] === to.age)
+            return;
+        to.preclocks.ages[clock.id] = to.age;
+        to.preclocks.clocks[to.preclocks.count++] = clock;
+    }
+    function logClockPreClock(sclock, rclock, rnode) {
+        var clocklog = rclock.preclocks || (rclock.preclocks = new ClockPreClockLog()), nodelog = rnode.preclocks || (rnode.preclocks = new NodePreClockLog());
+        if (nodelog.ages[sclock.id] === rnode.age)
+            return;
+        nodelog.ages[sclock.id] = rnode.age;
+        nodelog.uclocks[nodelog.ucount] = rclock;
+        nodelog.uclockids[nodelog.ucount++] = sclock.id;
+        var clockcount = clocklog.clockcounts[sclock.id];
+        if (!clockcount) {
+            if (clockcount === undefined)
+                clocklog.ids[clocklog.count++] = sclock.id;
+            clocklog.clockcounts[sclock.id] = 1;
+            clocklog.clocks[sclock.id] = sclock;
         }
-        Receiver.prototype.detach = function () {
-            var i = -1, len = this.edges.length;
-            while (++i < len) {
-                this.edges[i].deactivate();
-            }
-        };
-        Receiver.prototype.fragmented = function () {
-            return this.edges.length > 10 && this.edges.length / this.active > 4;
-        };
-        Receiver.prototype.compact = function () {
-            var i = -1, len = this.edges.length, edges = [], index = [], edge;
-            while (++i < len) {
-                edge = this.edges[i];
-                if (edge.active) {
-                    edges.push(edge);
-                    index[edge.from.id] = edge;
-                }
-            }
-            this.edges = edges;
-            this.index = index;
-        };
-        Receiver.count = 0;
-        return Receiver;
-    })();
-    var Edge = (function () {
-        function Edge(from, to, boundary) {
-            this.from = from;
-            this.to = to;
-            this.boundary = boundary;
-            this.age = Time;
-            this.active = true;
-            this.marked = false;
-            this.slot = from.edges.length;
-            this.slotAge = from.edgesAge;
-            from.edges.push(this);
-            to.edges.push(this);
-            to.index[from.id] = this;
-            from.active++;
-            to.active++;
+        else {
+            clocklog.clockcounts[sclock.id]++;
         }
-        Edge.prototype.activate = function (from) {
-            if (!this.active) {
-                this.active = true;
-                if (this.slotAge === from.edgesAge) {
-                    from.edges[this.slot] = this;
-                }
-                else {
-                    this.slotAge = from.edgesAge;
-                    this.slot = from.edges.length;
-                    from.edges.push(this);
-                }
-                this.to.active++;
-                from.active++;
-                this.from = from;
+    }
+    function event() {
+        RootClock.subclocks.reset();
+        RootClock.updates.reset();
+        RootClock.subtime++;
+        try {
+            run(RootClock);
+        }
+        finally {
+            RunningClock = Owner = RunningNode = null;
+        }
+    }
+    function toplevelComputation(node) {
+        RunningClock = RootClock;
+        RootClock.changes.reset();
+        RootClock.subclocks.reset();
+        RootClock.updates.reset();
+        try {
+            node.value = node.fn(node.value);
+            if (RootClock.changes.count > 0 || RootClock.subclocks.count > 0 || RootClock.updates.count > 0) {
+                RootClock.subtime++;
+                run(RootClock);
             }
-            this.age = Time;
-        };
-        Edge.prototype.deactivate = function () {
-            if (!this.active)
-                return;
-            var from = this.from, to = this.to;
-            this.active = false;
-            from.edges[this.slot] = null;
-            from.active--;
-            to.active--;
-            this.from = null;
-        };
-        return Edge;
-    })();
+        }
+        finally {
+            RunningClock = Owner = RunningNode = null;
+        }
+    }
+    function run(clock) {
+        var running = RunningClock, count = 0;
+        RunningClock = clock;
+        clock.disposes.reset();
+        // for each batch ...
+        while (clock.changes.count !== 0 || clock.subclocks.count !== 0 || clock.updates.count !== 0 || clock.disposes.count !== 0) {
+            if (count > 0)
+                clock.subtime++;
+            clock.changes.run(applyDataChange);
+            clock.subclocks.run(updateClock);
+            clock.updates.run(updateNode);
+            clock.disposes.run(dispose);
+            // if there are still changes after excessive batches, assume runaway            
+            if (count++ > 1e5) {
+                throw new Error("Runaway clock detected");
+            }
+        }
+        RunningClock = running;
+    }
+    function applyDataChange(data) {
+        data.value = data.pending;
+        data.pending = NOTPENDING;
+        if (data.log)
+            markComputationsStale(data.log);
+    }
+    function markComputationsStale(log) {
+        var nodes = log.nodes, nodeslots = log.nodeslots, dead = 0, slot, nodeslot;
+        // mark all downstream nodes stale which haven't been already, compacting log.nodes as we go
+        for (var i = 0; i < log.count; i++) {
+            var node = nodes[i];
+            if (node) {
+                var time = node.clock.time();
+                if (node.age < time) {
+                    markClockStale(node.clock);
+                    node.age = time;
+                    node.state = STALE;
+                    node.clock.updates.add(node);
+                    if (node.owned)
+                        markOwnedNodesForDisposal(node.owned);
+                    if (node.log)
+                        markComputationsStale(node.log);
+                }
+                if (dead) {
+                    slot = i - dead;
+                    nodeslot = nodeslots[i];
+                    nodes[i] = null;
+                    nodes[slot] = node;
+                    nodeslots[slot] = nodeslot;
+                    node.sourceslots[nodeslot] = slot;
+                }
+            }
+            else {
+                dead++;
+            }
+        }
+        log.count -= dead;
+        log.freecount = 0;
+    }
+    function markOwnedNodesForDisposal(owned) {
+        for (var i = 0; i < owned.length; i++) {
+            var child = owned[i];
+            child.age = child.clock.time();
+            child.state = CURRENT;
+            if (child.owned)
+                markOwnedNodesForDisposal(child.owned);
+        }
+    }
+    function markClockStale(clock) {
+        var time = 0;
+        if ((clock.parent && clock.age < (time = clock.parent.time())) || clock.state === CURRENT) {
+            if (clock.parent) {
+                clock.age = time;
+                markClockStale(clock.parent);
+                clock.parent.subclocks.add(clock);
+            }
+            clock.changes.reset();
+            clock.subclocks.reset();
+            clock.updates.reset();
+            clock.state = STALE;
+        }
+    }
+    function updateClock(clock) {
+        var time = clock.parent.time();
+        if (clock.age < time || clock.state === STALE) {
+            if (clock.age < time)
+                clock.state = CURRENT;
+            if (clock.preclocks) {
+                for (var i = 0; i < clock.preclocks.ids.length; i++) {
+                    var preclock = clock.preclocks.clocks[clock.preclocks.ids[i]];
+                    if (preclock)
+                        updateClock(preclock);
+                }
+            }
+            clock.age = time;
+        }
+        if (clock.state === RUNNING) {
+            throw new Error("clock circular reference");
+        }
+        else if (clock.state === STALE) {
+            clock.state = RUNNING;
+            run(clock);
+            clock.state = CURRENT;
+        }
+    }
+    function updateNode(node) {
+        if (node.state === STALE) {
+            var owner = Owner, running = RunningNode, clock = RunningClock;
+            Owner = RunningNode = node;
+            RunningClock = node.clock;
+            node.state = RUNNING;
+            cleanup(node, false);
+            node.value = node.fn(node.value);
+            node.state = CURRENT;
+            Owner = owner;
+            RunningNode = running;
+            RunningClock = clock;
+        }
+    }
+    function cleanup(node, final) {
+        var sources = node.sources, sourceslots = node.sourceslots, cleanups = node.cleanups, owned = node.owned, preclocks = node.preclocks, i, source, slot;
+        if (cleanups) {
+            for (i = 0; i < cleanups.length; i++) {
+                cleanups[i](final);
+            }
+            node.cleanups = null;
+        }
+        if (owned) {
+            for (i = 0; i < owned.length; i++) {
+                dispose(owned[i]);
+            }
+            node.owned = null;
+        }
+        for (i = 0; i < node.count; i++) {
+            source = sources[i];
+            slot = sourceslots[i];
+            source.nodes[slot] = null;
+            source.freeslots[source.freecount++] = slot;
+            sources[i] = null;
+        }
+        node.count = 0;
+        if (preclocks) {
+            for (i = 0; i < preclocks.count; i++) {
+                preclocks.clocks[i] = null;
+            }
+            preclocks.count = 0;
+            for (i = 0; i < preclocks.ucount; i++) {
+                var upreclocks = preclocks.uclocks[i].preclocks, uclockid = preclocks.uclockids[i];
+                if (--upreclocks.clockcounts[uclockid] === 0) {
+                    upreclocks.clocks[uclockid] = null;
+                }
+            }
+            preclocks.ucount = 0;
+        }
+    }
+    function dispose(node) {
+        node.fn = null;
+        node.log = null;
+        node.preclocks = null;
+        cleanup(node, true);
+    }
     // UMD exporter
     /* globals define */
     if (typeof module === 'object' && typeof module.exports === 'object') {
@@ -600,30 +601,39 @@
     }
 })();
 
-// sets, unordered and ordered, for S.js
+// synchronous array signals for S.js
 (function (package) {
-    if (typeof exports === 'object')
-        package(require('S')); // CommonJS
-    else if (typeof define === 'function')
+    if (typeof exports === 'object' && exports.__esModule) {
+        exports.default = package(require(S)); // ES6 to CommonJS
+    } else if (typeof module === 'object' && typeof module.exports === 'object') {
+        module.exports = package(require(S)); // CommonJS
+    } else if (typeof define === 'function') {
         define(['S'], package); // AMD
-    else package(S); // globals
+    } else {
+        (eval || function () {})("this").SArray = package(S); // globals
+    }
 })(function (S) {
     "use strict";
 
-    S.array = array;
+    return SArray;
 
-    function array(values) {
+    function SArray(values) {
         if (!Array.isArray(values))
             throw new Error("S.array must be initialized with an array");
 
-        var data = S.data(values);
+        var dirty     = S.data(false),
+            mutations = [],
+            mutcount  = 0,
+            pops      = 0,
+            shifts    = 0,
+            data      = S.root(function () { return S.on(dirty, update, values, true); });
 
         // add mutators
-        array.pop       = pop;
         array.push      = push;
+        array.pop       = pop;
+        array.unshift   = unshift;
         array.shift     = shift;
         array.splice    = splice;
-        array.unshift   = unshift;
 
         // not ES5
         array.remove    = remove;
@@ -633,68 +643,92 @@
         
         function array(newvalues) {
             if (arguments.length > 0) {
-                values = newvalues;
-                return data(newvalues);
+                mutation(function array() { values = newvalues; });
+                return newvalues;
             } else {
                 return data();
             }
         }
+
+        function mutation(m) {
+            mutations[mutcount++] = m;
+            dirty(true);
+        }
+        
+        function update() {
+            if (pops)   values.splice(values.length - pops, pops);
+            if (shifts) values.splice(0, shifts);
+            
+            pops     = 0;
+            shifts   = 0;
+            
+            for (var i = 0; i < mutcount; i++) {
+                mutations[i]();
+                mutations[i] = null;
+            }
+            
+            mutcount = 0;
+            
+            return values;
+        }
         
         // mutators
         function push(item) {
-            values.push(item);
-            data(values);
+            mutation(function push() { values.push(item); });
             return array;
         }
     
-        function pop(item) {
-            var value = values.pop();
-            data(values);
-            return value;
+        function pop() {
+            array();
+            if ((pops + shifts) < values.length) {
+                var value = values[values.length - ++pops];
+                dirty(true);
+                return value;
+            }
         }
     
         function unshift(item) {
-            values.unshift(item);
-            data(values);
+            mutation(function unshift() { values.unshift(item); });
             return array;
         }
     
-        function shift(item) {
-            var value = values.shift();
-            data(values);
-            return value;
+        function shift() {
+            array();
+            if ((pops + shifts) < values.length) {
+                var value = values[shifts++];
+                dirty(true);
+                return value;
+            }
         }
     
-        function splice(index, count, item) {
-            Array.prototype.splice.apply(values, arguments);
-            data(values);
+        function splice(/* arguments */) {
+            var args = Array.prototype.slice.call(arguments);
+            mutation(function splice() { Array.prototype.splice.apply(values, args); });
             return array;
         }
     
         function remove(item) {
-            for (var i = 0; i < values.length; i++) {
-                if (values[i] === item) {
-                    values.splice(i, 1);
-                    break;
+            mutation(function remove() {
+                for (var i = 0; i < values.length; i++) {
+                    if (values[i] === item) {
+                        values.splice(i, 1);
+                        break;
+                    }
                 }
-            }
-            
-            data(values);
+            });
             return array;
         }
     
         function removeAll(item) {
-            var i = 0;
-    
-            while (i < values.length) {
-                if (values[i] === item) {
-                    values.splice(i, 1);
-                } else {
-                    i++;
+            mutation(function removeAll() {
+                for (var i = 0; i < values.length; ) {
+                    if (values[i] === item) {
+                        values.splice(i, 1);
+                    } else {
+                        i++;
+                    }
                 }
-            }
-            
-            data(values);
+            });
             return array;
         }
     }
@@ -725,50 +759,63 @@
         s.orderBy     = orderBy;
 
         // schedulers
-        s.async        = async;
+        s.defer       = defer;
 
         return s;
     }
 
-    function mapS(fn) {
+    function mapS(enter, exit, move) {
         var seq = this,
             items = [],
             mapped = [],
+            disposers = enter ? [] : null,
             len = 0;
 
         var mapS = S(function mapS() {
             var new_items = seq(),
                 new_len = new_items.length,
                 temp = new Array(new_len),
-                i, j, k, item;
+                tempdisposers = enter ? new Array(new_len) : null,
+                from, to, i, j, k, item;
+
+            if (move) from = [], to = [];
 
             // 1) step through all old items and see if they can be found in the new set; if so, save them in a temp array and mark them moved; if not, exit them
             NEXT:
             for (i = 0, k = 0; i < len; i++) {
-                item = mapped[i];
+                item = items[i];
                 for (j = 0; j < new_len; j++, k = (k + 1) % new_len) {
-                    if (items[i] === new_items[k] && !temp.hasOwnProperty(k)) {
-                        temp[k] = item;
+                    if (item === new_items[k] && !temp.hasOwnProperty(k)) {
+                        temp[k] = mapped[i];
+                        if (enter) tempdisposers[k] = disposers[i];
+                        if (move && i !== k) { from.push(i); to.push(k); }
                         k = (k + 1) % new_len;
                         continue NEXT;
                     }
                 }
-                S.dispose(item);
+                if (exit) S.sample(function () { exit(item, enter ? mapped[i]() : mapped[i], i); });
+                if (enter) disposers[i]();
             }
+
+            if (move && from.length) S.sample(function () { move(items, mapped, from, to); });
 
             // 2) set all the new values, pulling from the temp array if copied, otherwise entering the new value
             for (i = 0; i < new_len; i++) {
                 if (temp.hasOwnProperty(i)) {
                     mapped[i] = temp[i];
+                    if (enter) disposers[i] = tempdisposers[i];
                 } else {
                     item = new_items[i];
-                    mapped[i] = (function (item, i) { 
-                        return S(function () { return fn(item, i); }, { toplevel: true }); 
-                    })(item, i);
+                    mapped[i] = !enter ? item : (function (item, value, i) { 
+                        return S.root(function (disposer) {
+                            if (enter) disposers[i] = disposer;
+                            return S(function () { return value = enter(item, value, i); });
+                        }); 
+                    })(item, undefined, i);
                 }
             }
             
-            S.cleanup(function (final) { if (final) mapped.map(S.dispose); });
+            S.cleanup(function (final) { if (final && enter) disposers.forEach(function (d) { d(); }); });
 
             // 3) in case the new set is shorter than the old, set the length of the mapped array
             len = mapped.length = new_len;
@@ -996,8 +1043,8 @@
     }
 
     // schedulers
-    function async(scheduler) {
-        return transformer(S.async(scheduler).S(this));
+    function defer(scheduler) {
+        return transformer(S.defer(scheduler).S(this));
     }
 });
 
@@ -1190,6 +1237,8 @@ define('tokenize', [], function () {
     return function tokenize(str, opts) {
         var toks = str.match(rx.tokens);
 
+        if (toks.join('') !== str) throw new Error("tokenize failure");
+
         return toks;
         //return TokenStream(toks);
     }
@@ -1256,7 +1305,7 @@ define('parse', ['AST'], function (AST) {
         "{": "}"
     };
 
-    return function parse(TOKS, opts) {
+    return function parse(TOKS, opts, orig) {
         var i = 0,
             EOF = TOKS.length === 0,
             TOK = !EOF && TOKS[i],
@@ -1370,7 +1419,7 @@ define('parse', ['AST'], function (AST) {
                     }
                 }
 
-                if (EOF) ERR("element missing close tag");
+                if (EOF) ERR("element missing close tag", start);
 
                 while (!EOF && NOT('>')) {
                     endTag += TOK, NEXT();
@@ -1441,14 +1490,18 @@ define('parse', ['AST'], function (AST) {
             match = rx.propertyLeftSide.exec(beginTag);
 
             // check if it's an attribute not a property assignment
-            if (match && NOT('"') && NOT("'")) {
-                beginTag = beginTag.substring(0, beginTag.length - match[0].length);
+            if (match) {
+                if (IS('"') || IS("'")) {
+                    beginTag += quotedString();
+                } else {
+                    beginTag = beginTag.substring(0, beginTag.length - match[0].length);
 
-                name = match[1];
+                    name = match[1];
 
-                SPLIT(rx.leadingWs);
+                    SPLIT(rx.leadingWs);
 
-                properties.push(new AST.Property(name, embeddedCode()));
+                    properties.push(new AST.Property(name, embeddedCode()));
+                }
             }
 
             return beginTag;
@@ -1581,7 +1634,8 @@ define('parse', ['AST'], function (AST) {
         }
 
         function ERR(msg, loc) {
-            var frag = loc ? " at line " + loc.line + " col " + loc.col + ": ``" + TOKS.join('').substr(loc.pos, 30).replace("\n", "") + "''" : "";
+            loc = loc || LOC();
+            var frag = " at line " + loc.line + " col " + loc.col + ": ``" + orig.substr(loc.pos, 30).replace("\n", "").replace("\r", "") + "''";
             throw new Error(msg + frag);
         }
 
@@ -1651,7 +1705,7 @@ define('genCode', ['AST', 'sourcemap'], function (AST, sourcemap) {
     // pre-compiled regular expressions
     var rx = {
         backslashes        : /\\/g,
-        newlines           : /\n/g,
+        newlines           : /\r?\n/g,
         singleQuotes       : /'/g,
         firstline          : /^[^\n]*/,
         lastline           : /[^\n]*$/,
@@ -1666,16 +1720,14 @@ define('genCode', ['AST', 'sourcemap'], function (AST, sourcemap) {
             + this.text
             + (opts.sourcemap ? sourcemap.segmentEnd() : "");
     };
-    var htmlLiteralId = 0;
     AST.HtmlLiteral.prototype.genCode = function (opts, prior) {
         var html = concatResults(opts, this.nodes, 'genHtml'),
-            nl = "\n" + indent(prior),
-            directives = this.nodes.length > 1 ? genChildDirectives(opts, this.nodes, nl) : this.nodes[0].genDirectives(opts, nl),
-            code = "new " + opts.symbol + "(" + htmlLiteralId++ + "," + nl + codeStr(html) + ")";
+            id = hash52(html),
+            nl = "\r\n" + indent(prior),
+            init = genInit(opts, this.nodes, nl),
+            code = opts.symbol + "(" + id + "," + nl + codeStr(html) + ")";
 
-        if (directives) code += nl + directives + nl;
-
-        code = "(" + code + ".node)";
+        if (init) code = "(" + init + ")(" + code + ")";
 
         return code;
     };
@@ -1688,61 +1740,64 @@ define('genCode', ['AST', 'sourcemap'], function (AST, sourcemap) {
     AST.HtmlText.prototype.genHtml    = function (opts) { return this.text; };
     AST.HtmlInsert.prototype.genHtml  = function (opts) { return '<!-- insert -->'; };
 
-    // genDirectives
-    AST.HtmlElement.prototype.genDirectives = function (opts, nl) {
-        var childDirectives = genChildDirectives(opts, this.content, nl),
-            properties = concatResults(opts, this.properties, 'genDirective', nl),
-            mixins = concatResults(opts, this.mixins, 'genDirective', nl);
-
-        return childDirectives + (childDirectives && (properties || mixins) ? nl : "")
-            + properties + (properties && mixins ? nl : "")
-            + mixins;
+    // genRefs
+    AST.HtmlElement.prototype.genCommands = function (opts, refs, cmds, refnum, parentnum, child) {
+        for (var i = 0; i < this.content.length; i++) {
+            this.content[i].genCommands(opts, refs, cmds, Math.max(refnum + 1, refs.length), refnum, i);
+        }
+        for (i = 0; i < this.properties.length; i++) {
+            this.properties[i].genCommand(opts, cmds, refnum);
+        }
+        for (i = 0; i < this.mixins.length; i++) {
+            this.mixins[i].genCommand(opts, cmds, refnum);
+        }
+        if (this.properties.length || this.mixins.length || refs.length !== refnum) {
+            if (refnum !== -1) refs[refnum] = declareRef(refnum, parentnum, child);
+        }
     };
-    AST.HtmlComment.prototype.genDirectives =
-    AST.HtmlText.prototype.genDirectives    = function (opts, nl) { return null; };
-    AST.HtmlInsert.prototype.genDirectives  = function (opts, nl) {
-        return ".insert(function () { return " + this.code.genCode(opts) + "; })";
-    }
+    AST.HtmlComment.prototype.genCommands =
+    AST.HtmlText.prototype.genCommands    = function (opts, refs, cmds, refnum, parentnum, child) { };
+    AST.HtmlInsert.prototype.genCommands  = function (opts, refs, cmds, refnum, parentnum, child) {
+        refs[refnum] = declareRef(refnum, parentnum, child);
+        cmds.push(opts.symbol + ".exec(function (state) { return Html.insert(" + ref(refnum) + ", " + this.code.genCode(opts) + ", state); });");
+    };
 
     // genDirective
-    AST.Property.prototype.genDirective = function (opts) {
+    AST.Property.prototype.genCommand = function (opts, cmds, refnum) {
         var code = this.code.genCode(opts);
-        return ".property(function (__) { __." + this.name + " = " + code + "; })";
+        cmds.push(opts.symbol + ".exec(function () { " + ref(refnum) + "." + this.name + " = " + code + "; });");
     };
-    AST.Mixin.prototype.genDirective = function (opts) {
-        return ".mixin(function () { return " + this.code.genCode(opts) + "; })";
+    AST.Mixin.prototype.genCommand = function (opts, cmds, refnum) {
+        var code = this.code.genCode(opts);
+        cmds.push(opts.symbol + ".exec(function (state) { return " + this.code.genCode(opts) + "(" + ref(refnum) + ", state); });");
     };
 
-    function genChildDirectives(opts, childNodes, nl) {
-        var indices = [],
-            directives = [],
-            identifiers = [],
+    function declareRef(refnum, parentnum, child) {
+        return "var " + ref(refnum) + " = " + ref(parentnum) + ".childNodes[" + child + "];";
+    }
+
+    function ref(refnum) {
+        return "__" + (refnum === -1 ? '' : refnum);
+    }
+
+    function genInit(opts, nodes, nl) {
+        var refs = [],
+            cmds = [],
+            //identifiers = [],
             cnl = nl + "    ",
-            ccnl = cnl + "     ",
-            directive,
-            i,
-            result = "";
+            i;
 
-        for (i = 0; i < childNodes.length; i++) {
-            directive = childNodes[i].genDirectives(opts, ccnl);
-            if (directive) {
-                indices.push(i);
-                identifiers.push(childIdentifier(childNodes[i]));
-                directives.push(directive);
+        if (nodes.length === 1) {
+            nodes[0].genCommands(opts, refs, cmds, -1, -1, 0);
+        } else {
+            for (i = 0; i < nodes.length; i++) {
+                nodes[i].genCommands(opts, refs, cmds, refs.length, -1, i);
             }
         }
 
-        if (indices.length) {
-            result += ".child([" + indices.join(", ") + "], function (__) {" + cnl;
-            for (i = 0; i < directives.length; i++) {
-                if (i) result += cnl;
-                result += "// " + identifiers[i] + cnl;
-                result += "__[" + i + "]" + directives[i] + ";"
-            }
-            result += nl + "})";
-        }
+        if (cmds.length === 0) return null;
 
-        return result;
+        return "function (__) {" + cnl + refs.join(cnl) + cnl + cmds.join(cnl) + cnl + "return __;" + nl + "}";
     }
 
     function concatResults(opts, children, method, sep) {
@@ -1776,6 +1831,22 @@ define('genCode', ['AST', 'sourcemap'], function (AST, sourcemap) {
     function firstline(str) {
         var l = rx.firstline.exec(str);
         return l ? l[0] : '';
+    }
+
+    var MAX32 = Math.pow(2 ,32);
+
+    // K&R hash, returning 52-bit integer, the max a double can represent
+    // this gives us an 0.0001% chance of collision with 67k templates (a lot of templates)
+    function hash52(str) {
+        var low = 0, high = 0, i, len, c, v;
+        for (i = 0, len = str.length; i < len; i++) {
+            c = str.charCodeAt(i);
+            v = (low * 31) + c;
+            low = v|0;
+            c = (v - low) / MAX32;
+            high = (high * 31 + c)|0;
+        }
+        return ((high & 0xFFFFF) * MAX32) + low;
     }
 });
 
@@ -1872,7 +1943,7 @@ define('preprocess', ['tokenize', 'parse', 'shims', 'sourcemap'], function (toke
         opts.sourcemap = opts.sourcemap || null;
 
         var toks = tokenize(str, opts),
-            ast = parse(toks, opts);
+            ast = parse(toks, opts, str);
 
         if (shimmed) ast.shim();
 
@@ -2013,9 +2084,8 @@ define('parse', [], function () {
                 frag.appendChild(container.childNodes[0]);
             }
 
-            frag.startNode = frag.firstChild;
-            frag.endNode = frag.lastChild;
-
+            frag.originalNodes = Array.prototype.slice.apply(frag.childNodes);
+            
             return frag;
         }
     }
@@ -2045,8 +2115,7 @@ define('cachedParse', ['parse'], function (parse) {
         copy = cached.cloneNode(true);
 
         if (copy.nodeType === DOCUMENT_FRAGMENT_NODE) {
-            copy.startNode = copy.firstChild;
-            copy.endNode = copy.lastChild;
+            copy.originalNodes = Array.prototype.slice.call(copy.childNodes);
         }
 
         return copy;
@@ -2054,47 +2123,12 @@ define('cachedParse', ['parse'], function (parse) {
 })
 
 define('Html', ['parse', 'cachedParse', 'domlib'], function (parse, cachedParse, domlib) {
-    function Html(node, cache) {
-        if (node.nodeType === undefined)
-            node = cache ? cachedParse(node, cache) : parse(node);
-
-        this.node = node;
+    function Html(id, html) {
+        return cachedParse(id, html);
     }
 
-    Html.prototype = {
-        child: function child(indices, fn) {
-            var children = this.node.childNodes,
-                len = indices.length,
-                childShells = new Array(len),
-                i, child;
-
-            if (children === undefined)
-                throw new Error("Shell.childNodes can only be applied to a node with a \n"
-                    + ".childNodes collection.  Node ``" + this.node + "'' does not have one. \n"
-                    + "Perhaps you applied it to the wrong node?");
-
-            for (i = 0; i < len; i++) {
-                child = children[indices[i]];
-                if (!child)
-                    throw new Error("Node ``" + this.node + "'' does not have a child at index " + i + ".");
-
-                childShells[i] = new Html(child);
-            }
-
-            fn(childShells);
-
-            return this;
-        },
-
-        property: function property(setter) {
-            setter(this.node);
-            return this;
-        },
-        
-        mixin: function mixin(fn) {
-            fn()(this.node);
-            return this;
-        }
+    Html.exec = function exec(fn) {
+        fn();
     };
 
     Html.cleanup = function (node, fn) {
@@ -2112,38 +2146,46 @@ define('Html.insert', ['Html'], function (Html) {
     var DOCUMENT_FRAGMENT_NODE = 11,
         TEXT_NODE = 3;
         
-    Html.prototype.insert = function insert(value) {
-        var node = this.node,
-            parent = node.parentNode,
-            start = marker(node),
+    Html.insert = function insert(node, value, start) {
+        start = start || marker(node);
+        var parent, cursor;
+
+        unwrap(value);
+
+        return start;
+
+        function unwrap(value) {
+            if (value instanceof Function) {
+                Html.exec(function insert() {
+                    unwrap(value());
+                });
+            } else {
+                insert(value);
+            }
+        }
+
+        function insert(value) {
+            parent = node.parentNode;
+
+            if (!parent) {
+                throw new Error("@insert can only be used on a node that has a parent node. \n"
+                    + "Node ``" + node + "'' is currently unattached to a parent.");
+            }
+            
+            if (start.parentNode !== parent) {
+                throw new Error("@insert requires that the inserted nodes remain sibilings \n"
+                    + "of the original node.  The DOM has been modified such that this is \n"
+                    + "no longer the case.");
+            }
+
+            // set our cursor to the start of the insert range
             cursor = start;
 
-        return this.mixin(insert);
+            // insert the current value
+            insertValue(value);
 
-        function insert() {
-            return function insert(node, state) {
-                parent = node.parentNode;
-    
-                if (!parent) {
-                    throw new Error("@insert can only be used on a node that has a parent node. \n"
-                        + "Node ``" + node + "'' is currently unattached to a parent.");
-                }
-                
-                if (start.parentNode !== parent) {
-                    throw new Error("@insert requires that the inserted nodes remain sibilings \n"
-                        + "of the original node.  The DOM has been modified such that this is \n"
-                        + "no longer the case.");
-                }
-    
-                // set our cursor to the start of the insert range
-                cursor = start;
-    
-                // insert the current value
-                insertValue(value());
-    
-                // remove anything left after the cursor from the insert range
-                clear(cursor, node);
-            };
+            // remove anything left after the cursor from the insert range
+            clear(cursor, node);
         }
 
         // value ::
@@ -2158,9 +2200,9 @@ define('Html.insert', ['Html'], function (Html) {
                 // nothing to insert
             } else if (value.nodeType === DOCUMENT_FRAGMENT_NODE) {
                 // special case for document fragment that has already been emptied:
-                // use the cached start and end nodes and insert as a range
-                if (value.childNodes.length === 0 && value.startNode && value.endNode) {
-                    insertRange(value.startNode, value.endNode);
+                // use the cached originalNodes array and insert as an array
+                if (value.childNodes.length === 0 && value.originalNodes) {
+                    insertArray(value.originalNodes);
                 } else {
                     parent.insertBefore(value, next);
                     cursor = next.previousSibling;
@@ -2206,28 +2248,6 @@ define('Html.insert', ['Html'], function (Html) {
             }
         }
 
-        function insertRange(head, end) {
-            var node,
-                next = cursor.nextSibling;
-
-            if (head.parentNode !== end.parentNode)
-                throw new Error("Range must be siblings");
-
-            do {
-                node = head, head = head.nextSibling;
-
-                if (!node) throw new Error("end must come after head");
-
-                if (node !== next) {
-                    parent.insertBefore(node, next);
-                } else {
-                    next = next.nextSibling;
-                }
-            } while (node !== end);
-
-            cursor = end;
-        }
-
         function clear(start, end) {
             if (start === end) return;
             var next = start.nextSibling;
@@ -2238,7 +2258,7 @@ define('Html.insert', ['Html'], function (Html) {
         }
 
         function marker(el) {
-            return parent.insertBefore(document.createTextNode(""), el);
+            return el.parentNode.insertBefore(document.createTextNode(""), el);
         }
     };
 });
@@ -2472,41 +2492,7 @@ define('Html.onkey', ['Html'], function (Html) {
 })(function (S, Html) {
     "use strict";
 
-    Html.prototype.mixin = function mixin(fn) {
-        var node = this.node,
-            state;
-
-        //var logFn = function() {
-        //    var args = Array.prototype.slice.call(arguments);
-        //    console.log("[@" + name + "(" + args.join(", ") + ")]");
-        //    fn.apply(undefined, args);
-        //};
-
-        S(function mixin() {
-            //values(logFn);
-            state = fn()(node, state);
-        });
-        
-        return this;
-    };
-
-    Html.prototype.property = function property(setter) {
-        var node = this.node;
-
-        //var logSetter = function (node) {
-        //    var msg = setter.toString().substr(18); // remove "function () { __."
-        //    msg = msg.substr(0, msg.length - 3); // remove "; }"
-        //    console.log("[@" + node.nodeName + msg + "]");
-        //    setter(node);
-        //};
-
-        S(function property() {
-            //logSetter(node);
-            setter(node);
-        });
-
-        return this;
-    };
+    Html.exec = S;
 
     Html.cleanup = function cleanup(node, fn) {
         S.cleanup(fn);
@@ -2546,7 +2532,7 @@ define('Html.onkey', ['Html'], function (Html) {
                 S.cleanup(function () { Html.domlib.removeEventListener(node, event, valueListener); });
 
                 function valueListener() {
-                    var cur = S.peek(signal),
+                    var cur = S.sample(signal),
                         update = node.value;
                     if (cur.toString() !== update) signal(update);
                     return true;
@@ -2597,7 +2583,7 @@ define('Html.onkey', ['Html'], function (Html) {
                 S.cleanup(function () { Html.domlib.removeEventListener(node, event, textContentListener); });
 
                 function textContentListener() {
-                    var cur = S.peek(signal),
+                    var cur = S.sample(signal),
                         update = node.textContent;
                     if (cur.toString() !== update) signal(update);
                     return true;
@@ -2605,27 +2591,47 @@ define('Html.onkey', ['Html'], function (Html) {
             }
         };
     };
+    
+    Html.animationFrame = function animationFrame(go) {
+        var scheduled = false,
+            args = null;
+    
+        return tick;
+    
+        function tick() {
+            args = Array.prototype.slice.apply(arguments);
+            if (!scheduled) {
+                scheduled = true;
+                requestAnimationFrame(run);
+            }
+        }
+        
+        function run() {
+            scheduled = false;
+            go.apply(null, args);
+        }
+    }
 });
 
 (function (package) {
     if (typeof exports === 'object')
-        package(require('S'), require('htmlliterals-runtime')); // CommonJS
+        package(require('S'), require('SArray'), require('htmlliterals-runtime')); // CommonJS
     else if (typeof define === 'function')
-        define(['S', 'htmlliterals-runtime'], package); // AMD
-    else package(S, htmlliterals); // globals
-})(function (S, htmlliterals) {
+        define(['S', 'SArray', 'htmlliterals-runtime'], package); // AMD
+    else package(S, SArray, htmlliterals); // globals
+})(function (S, SArray, htmlliterals) {
     var type = 'text/javascript-htmlliterals',
         config = window.surplus || {},
         XHR_DONE = 4;
 
-    var scripts = S.array([]),
+    var scripts = SArray([]),
         i = 0;
 
-    S(function surplusPreprocessQueue() {
+    S.root(function () { return S(function surplusPreprocessQueue() {
         for (; i < scripts().length && scripts()[i].source() !== undefined; i++) {
             preprocess(scripts()[i]);
         }
-    });
+    }); });
 
     preprocessAllScripts();
 

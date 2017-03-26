@@ -1,22 +1,22 @@
 (function (package) {
     if (typeof exports === 'object')
-        package(require('S'), require('htmlliterals-runtime')); // CommonJS
+        package(require('S'), require('SArray'), require('htmlliterals-runtime')); // CommonJS
     else if (typeof define === 'function')
-        define(['S', 'htmlliterals-runtime'], package); // AMD
-    else package(S, htmlliterals); // globals
-})(function (S, htmlliterals) {
+        define(['S', 'SArray', 'htmlliterals-runtime'], package); // AMD
+    else package(S, SArray, htmlliterals); // globals
+})(function (S, SArray, htmlliterals) {
     var type = 'text/javascript-htmlliterals',
         config = window.surplus || {},
         XHR_DONE = 4;
 
-    var scripts = S.array([]),
+    var scripts = SArray([]),
         i = 0;
 
-    S(function surplusPreprocessQueue() {
+    S.root(function () { return S(function surplusPreprocessQueue() {
         for (; i < scripts().length && scripts()[i].source() !== undefined; i++) {
             preprocess(scripts()[i]);
         }
-    });
+    }); });
 
     preprocessAllScripts();
 
