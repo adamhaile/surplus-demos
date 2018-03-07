@@ -1,0 +1,69 @@
+<h1>Minimalist Hash Routing with Surplus</h1>
+<script type="text/jsx">
+// Super-simple hash-based router
+// "#!foo/bar/1" runs the 'foo' route from the table, passing it the params ["bar", "1"] 
+// See the end of this file for an example usage.
+const HashRouter = routes => {
+    const
+        // data signal to track the state of window.location.hash 
+        hash = S.data(window.location.hash),
+        // and a function to update it
+        updateHash = () => hash(window.location.hash),
+        // computation to find the route for the current hash and call it, constructing the current view
+        view = S(() => {
+            // convert the hash to a path by removing #! and splitting on '/', so '#!item/1' becomes ["item", "1"]
+            const path = hash().replace(/^#?!?/, '').split(/\//);
+
+            if (!(path[0] in routes)) return <div>No route matches {path[0]}</div>;
+
+            return routes[path[0]](path.slice(1));
+        });
+
+    // make router live by subscribing to hash changes
+    window.addEventListener('hashchange', updateHash);
+    S.cleanup(() => window.removeEventListener('hashchange', updateHash));
+
+    return { view };
+};
+
+// now build a dummy app to demo the router
+
+// some data
+const items = [ 
+    { id: 1, name : "foo"}, 
+    { id: 2, name: "bar" }, 
+    { id: 3, name: "baz" } 
+];
+
+// some components
+const 
+    // a clickable list of items
+    Index = ({items}) => 
+        <ul>{items.map(item => 
+            <li><a href={`#!item/${item.id}`}>Go to {item.name}</a></li>
+        )}</ul>,
+    // a single item with a return link
+    Item = ({item}) => 
+        <div>
+            <h3>You clicked on {item.name} (item #{item.id})</h3>
+            <a href="#!">Go back to index</a>
+        </div>;
+
+// our routing table
+const routes = {
+    // empty hash (default) displays the Index
+    '': () => <Index items={items} />,
+    // '#!item/id' displays Item
+    item: ([id]) => <Item item={items.find(item => item.id === +id)} />
+};
+
+// build our router and append the view into the page
+S.root(() => {
+    const router = HashRouter(routes);
+    document.body.appendChild(
+        <div className="app">{router.view()}</div>
+    );
+});
+
+</script>
+<script type="text/javascript" src="../../surplus-toys/index.js"></script>

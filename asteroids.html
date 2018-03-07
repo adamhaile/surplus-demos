@@ -26,7 +26,6 @@
 </head>
 <body>
     <script type="text/javascript">
-
         function World(width, height) {
             var w    = this;
 
@@ -148,7 +147,7 @@
             return Math.sqrt(dx * dx + dy * dy);
         }
     </script>
-    <script type="text/javascript-htmlliterals">
+    <script type="text/jsx">
         var Game = Constructor(function () {
                 var g = this;
                 //World.call(this, 1000 * innerWidth / (innerWidth + innerHeight), 1000 * innerHeight / (innerWidth + innerHeight));
@@ -159,8 +158,8 @@
 
                 this.player = S.data(new Player(this));
                 
-                this.asteroids = SArray([]);
-                this.bullets = SArray([]);
+                this.asteroids = SArray.default([]);
+                this.bullets = SArray.default([]);
 
                 new Asteroid(this, 40, null);
                 new Asteroid(this, 40, null);
@@ -307,8 +306,7 @@
                 w.bullets.push(this);
                 S.cleanup(() => w.bullets.remove(this));
             }),
-            attr = Html.attr,
-            onkey = Html.onkey,
+            onkey = SurplusDataMixin.default,
             View = function (g) {
                 onkey('uparrow',    'down', () => g.player().engineOn())(document.body);
                 onkey('uparrow',    'up',   () => g.player().engineOff())(document.body);
@@ -321,54 +319,54 @@
                 onkey('i',          'down', () => g.invincible(true))(document.body);
                 onkey('b',          'down', () => g.player().bench())(document.body);
 
-                var things = g.things.map(t =>
-                        t instanceof Ship ?
-                            <svg class = "ship"
-                                 @attr('x', t.x() - 15)
-                                 @attr('y', t.y() - 15)
-                                 width = "30"
-                                 height = "30">
-                                <g @attr('transform', "rotate(" + (t.tau() * 180 / Math.PI) + " 15 15)")>
-                                    <polygon points = "10,12 15,25 20,12, 18,14 12,14" />
-                                    <polygon points = "14,5 14,15 16,15 16,5" style.opacity = (t.F() ? 1 : 0)/>
-                                    <polygon points = "15,23 10,23 10,24 15,24 15,23" style.opacity = (t.omega() < 0 ? 1 : 0)/>
-                                    <polygon points = "15,23 20,23 20,24 15,24 15,23" style.opacity = (t.omega() > 0 ? 1 : 0)/>
-                                </g>
-                            </svg> :
-                        t instanceof Bullet ?
-                            <line class="bullet" x1 = "0" x2 = "0"
-                                  @attr('x2', t.vx() * 0.02)
-                                  @attr('y2', t.vy() * 0.02)
-                                  @attr('transform', "translate(" + t.x() + " " + t.y() + ")") /> :
-                        t instanceof Asteroid ?
-                            <circle class="asteroid" cx = "0" cy = "0"
-                                  @attr('r', t.radius())
-                                  @attr('transform', "translate(" + t.x() + " " + t.y() + ")") /> :
-                        null
-                    );
+                var bullets = g.bullets.map(t => 
+                        <line class="bullet" x1 = "0" x2 = "0"
+                                x2={t.vx() * 0.02}
+                                y2={t.vy() * 0.02}
+                                transform={"translate(" + t.x() + " " + t.y() + ")"} />),
+                    asteroids = g.asteroids.map(t =>
+                        <circle class="asteroid" cx = "0" cy = "0"
+                                r={t.radius()}
+                                transform={"translate(" + t.x() + " " + t.y() + ")"} />),
+                    ship = 
+                        <svg class = "ship"
+                                x={g.ship().x() - 15}
+                                y={g.ship().y() - 15}
+                                width = "30"
+                                height = "30">
+                            <g transform={"rotate(" + (g.ship().tau() * 180 / Math.PI) + " 15 15)"}>
+                                <polygon points = "10,12 15,25 20,12, 18,14 12,14" />
+                                <polygon points = "14,5 14,15 16,15 16,5" style-opacity = {g.ship().F() ? 1 : 0}/>
+                                <polygon points = "15,23 10,23 10,24 15,24 15,23" style-opacity = {g.ship().omega() < 0 ? 1 : 0}/>
+                                <polygon points = "15,23 20,23 20,24 15,24 15,23" style-opacity = {g.ship().omega() > 0 ? 1 : 0}/>
+                            </g>
+                        </svg>,
+                    things = () => g.bullets().length + g.asteroids().length + 1;
 
                 return (
                     <svg class="world"
-                         @attr('viewBox', "0 0 " + g.width() + " " + g.height())
+                         viewBox={"0 0 " + g.width() + " " + g.height()}
                          preserveAspectRatio = "xMidYMax">
 
-                        @things()
+                        {bullets}
+                        {asteroids}
+                        {ship}
 
-                        @Array.apply(0, new Array(g.ships())).map((_, i) =>
-                            <svg @attr('x', g.width() - 30 * i - 30) y = "0">
+                        {Array.apply(0, new Array(g.ships())).map((_, i) =>
+                            <svg x={g.width() - 30 * i - 30} y = "0">
                                 <polygon points = "10,15 15,25 20,15" />
                             </svg>
-                        )
+                        )}
 
-                        <text x="0" y="15">fps:    </text><text x="60" y="15">@g.fps().toFixed(1)</text>
-                        <text x="0" y="30">objects:</text><text x="60" y="30">@g.things().length</text>
-                        <text x="0" y="45">obj/s:  </text><text x="60" y="45">@(g.things().length * g.fps()).toFixed(0)</text>
+                        <text x="0" y="15">fps:    </text><text x="60" y="15">{g.fps().toFixed(1)}</text>
+                        <text x="0" y="30">objects:</text><text x="60" y="30">{things()}</text>
+                        <text x="0" y="45">obj/s:  </text><text x="60" y="45">{(things() * g.fps()).toFixed(0)}</text>
 
-                        <text @attr('x', g.width() / 2) @attr('y', g.height() / 2 + 40) text-anchor="middle">
-                            @(g.paused() ? "-- hit space to start --" :
+                        <text x={g.width() / 2} y={g.height() / 2 + 40} text-anchor="middle">
+                            { g.paused() ? "-- hit space to start --" :
                               g.lose()   ? "-- game over --" :
                               g.win()    ? "-- you win! --" :
-                                           "")
+                                           "" }
                         </text>
                     </svg>
                 );
@@ -387,7 +385,7 @@
                     onkey('b',          'down', () => g.player().bench())
                 ].map(action => action(document.body));
 
-                var canvas = <canvas width = g.width() height = g.height()></canvas>,
+                var canvas = <canvas width = {g.width()} height = {g.height()}></canvas>,
                     ctx = canvas.getContext("2d");
 
                 ctx.font = "18px helvetica";
@@ -466,13 +464,15 @@
                 return canvas;
             };
 
-        S.root(function () {
+        S.root(() => {
             game = new Game();
             view = S(() => CanvasView(game));
 
             document.body.appendChild(view());
         });
     </script>
-    <script type="text/javascript" src="../dist/surplus.js"></script>
+    <script type="text/javascript" src="../../surplus-toys/index.js"></script>
+    <script src="http://unpkg.com/surplus-mixin-onkey"></script>
+    <script src="http://unpkg.com/s-array"></script>
 </body>
 </html>

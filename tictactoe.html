@@ -28,7 +28,7 @@
     </style>
 </html>
 <body>
-    <script type="text/javascript-htmlliterals">
+    <script type="text/jsx">
         var X = 'X',
             O = 'O',
             range = size => Array.apply(0, Array(size)).map((_, i) => i), // helper to create array [0 .. size - 1]
@@ -62,24 +62,26 @@
                 };
             },
             View = game =>
-                <h2>Tic-Tac-Toe</h2>
-                <table>
-                    <tbody>@game.board.map((row, x) =>
-                        <tr>@row.map((cell, y) =>
-                            <td @Html.class('open', !cell()) onclick = (() => game.move(x, y))>
-                                @cell()
-                            </td>
-                        )</tr>
-                    )</tbody>
-                </table>
-                <h5>@game.goal+"-in-a-row" to win</h5>
-                <h5 hidden = game.over()>Turn: @game.turn()</h5>
-                <h5 hidden = !game.over()>@(game.winner() ? game.winner() + " wins!" : "draw")</h5>
+                <div>
+                    <h2>Tic-Tac-Toe</h2>
+                    <table>
+                        <tbody>{game.board.map((row, x) =>
+                            <tr>{row.map((cell, y) =>
+                                <td class={cell() ? '' : 'open'} onclick = {() => game.move(x, y)}>
+                                    {cell()}
+                                </td>
+                            )}</tr>
+                        )}</tbody>
+                    </table>
+                    <h5>Get {game.goal}-in-a-row to win</h5>
+                    <h5 hidden={game.over()}>Turn: {game.turn()}</h5>
+                    <h5 hidden={!game.over()}>{game.winner() ? game.winner() + " wins!" : "draw"}</h5>
+                </div>,
             game = Game(6, 4),
             view = View(game);
 
             document.body.appendChild(view);
     </script>
-    <script type="text/javascript" src="../dist/surplus.js"></script>
+    <script type="text/javascript" src="../../surplus-toys/index.js"></script>
 </body>
 <html>

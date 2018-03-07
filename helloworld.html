@@ -1,0 +1,12 @@
+<h1>Hello World with Surplus-toys</h1>
+<script type="text/jsx">
+var you = S.data("World");
+document.body.appendChild(
+    <div>
+        Your name: <input type="text" value={you()} onInput={e => you(e.target.value)} />
+        <br/>
+        Hello {you()}!
+    </div>
+)
+</script>
+<script src="http://unpkg.com/surplus-toys"></script>
