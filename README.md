@@ -25,6 +25,10 @@ Small example apps written using [Surplus](https://github.com/adamhaile/surplus)
     [run](https://adamhaile.github.com/surplus-demos/asteroids.html),
     [view code](https://github.com/adamhaile/surplus-demos/blob/master/asteroids.html)
   ]
+- Strange Attractor [
+    [run](https://adamhaile.github.com/surplus-demos/strange.html),
+    [view code](https://github.com/adamhaile/surplus-demos/blob/master/strange.html)
+]
 
 These apps use [surplus-toys](https://github.com/adamhaile/surplus-toys) for simple one-file Surplus demos.
 

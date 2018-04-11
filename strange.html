@@ -1,0 +1,198 @@
+<style>
+    canvas, svg {
+        position: fixed;
+        top: 0;
+        left: 0;
+        cursor: crosshair;
+    }
+
+    text {
+        font-family: sans-serif;
+        fill: rgba(0, 0, 0, 0.6);
+    }
+
+    circle.attractor {
+        cursor: pointer;
+        fill: rgba(0, 187, 0, 0.6);
+    }
+
+    circle.repulsor {
+        cursor: pointer;
+        fill: rgba(187, 0, 0, 0.6);
+    }
+
+    a {
+        cursor: pointer;
+        text-decoration: underline;
+    }
+
+</style>
+<script type="text/jsx">
+// constants
+let GRAVITY = 0.1, // how forcefully dots push/pull ball
+    DRAG = 0.0007, // drag, how quickly we drain energy from system
+    MINDISTANCE = 4; // min distance used to calc force b/w ball and dot, caps forward integration glitch
+
+// use rAF to create a dt() signal that drives animation
+let t = S.data(0), // time signal, fed from the rAF loop
+    ts = S(ts => (ts[1] = ts[0], ts[0] = t(), ts), [0, 0]), // last two time values
+    rawdt = S(() => ts()[0] - ts()[1]), // delta b/w last two ts
+    dt = S(dt => rawdt() > 200 ? dt : rawdt(), 16), // if rawdt has a big jump, re-use previous dt
+    loop = _t => (t(_t), requestAnimationFrame(loop)); // rAF loop
+
+// world dimensions, fills screen
+let width = window.innerWidth,
+    height = window.innerHeight;
+
+// our state: dots and ball location
+let ball = S.data({ 
+        x: width / 2, 
+        y: height / 2,
+        vx: 0,
+        vy: 0
+    }),
+    dots = SArray.default([]);
+
+// ui actions
+let addDot = e => 
+        dots.push({
+            x: e.pageX,
+            y: e.pageY,
+            p: e.shiftKey ? -1 : 1
+        }),
+    removeDot = d => e => {
+        dots.remove(d);
+        e.stopPropagation();
+    },
+    restart = e => S.freeze(() => {
+        ctx.clearRect(0, 0, width, height);
+        dots([]);
+        ball({ x: width / 2, y: height / 2, vx: 0, vy: 0});
+        e.stopPropagation();
+    });
+
+// store / refresh dot locations in browser hash for linkability
+let pack = n => Math.round(n).toString(36),
+    unpack = s => parseInt(s, 36);
+
+if (location.hash) {
+    // hashed world may have had different dims, need to re-center
+    let hh = height, hw = width;
+
+    location.hash.replace(/([#+-])(\w+)\.(\w+)/g, (_, p, x, y) => 
+        p === '#' ? (hw = unpack(x), hh = unpack(y)) :
+        dots.push({ 
+            x: unpack(x) + (width - hw) / 2, 
+            y: unpack(y) + (height - hh) / 2, 
+            p: p === '+' ? 1 : -1 
+        })
+    );
+}
+
+S(() => {
+    const hash = '#' + pack(width) + '.' + pack(height) + dots().map(b => (b.p > 0 ? '+' : '-') + pack(b.x) + '.' + pack(b.y)).join('');
+    window.location.replace(hash);
+});
+
+// animation: forward integrate ball location on each dt
+S.on(dt, () => {
+    var _dt = dt(),
+        b = ball();
+
+    // start with base drag
+    var f = { fx: -DRAG * b.vx, fy: -DRAG * b.vy };
+
+    // add force from each dot
+    for (var d of dots()) {
+        addForce(b, d, f);
+    }
+
+    // simple forward integration
+    // glitches when f changing fast, kicking ball out of attractors
+    b.vx += f.fx * _dt;
+    b.vy += f.fy * _dt;
+    b.x += b.vx * _dt;
+    b.y += b.vy * _dt;
+
+    // wrap position on torus
+    b.x = (b.x + width) % width;
+    b.y = (b.y + height) % height;
+
+    ball(b);
+});
+
+// add toroidal force b/w ball and dot to sum f
+function addForce(b, d, f) {
+    let // distance to dot
+        dx = d.x - b.x,
+        dy = d.y - b.y,
+        // distance to dot in nearest x,y toroidal world projection
+        rdx = dx < 0 ? dx + width  : dx - width,
+        rdy = dy < 0 ? dy + height : dy - height,
+        // scaling factors: as we approach a projected world, its dot's influence ramps linearly
+        sx = 1 - Math.abs(dx) / width,
+        sy = 1 - Math.abs(dy) / height;
+
+    // toroidal forces from this world and nearest 3 toroidal projections
+    addProjectedForce( dx,  dy, d.p * sx     * sy    , f);
+    addProjectedForce( dx, rdy, d.p * sx     * (1-sy), f);
+    addProjectedForce(rdx,  dy, d.p * (1-sx) * sy    , f);
+    addProjectedForce(rdx, rdy, d.p * (1-sx) * (1-sy), f);
+}
+
+function addProjectedForce(dx, dy, p, f) {
+    var d2 = dx * dx + dy * dy;
+
+    // cap minimum distance used for force calcs to avoid exploding simple integration
+    if (d2 < MINDISTANCE) d2 = MINDISTANCE;
+
+    f.fx += (GRAVITY / d2) * dx * p;
+    f.fy += (GRAVITY / d2) * dy * p;
+}
+
+// view with 2 drawing surfaces: svg for ball and dots, canvas for traces
+let canvas, svg, view = (
+        <div>
+            <canvas ref={canvas} width={width} height={height}></canvas>
+            <svg ref={svg} height={height} width={width}>
+                <rect x="0" y="0" width={width} height={height} fill="transparent" onClick={addDot}></rect>
+                {dots().length === 0 ? [
+                    <text x={width / 2} y={height / 2 - 220} text-anchor="middle">strange attractor</text>,
+                    <text x={width / 2} y={height / 2 - 170} text-anchor="middle">click anywhere on screen to add an attractor dot</text>,
+                    <text x={width / 2} y={height / 2 - 140} text-anchor="middle">shift+click to add a repulsor dot</text>,
+                    <text x={width / 2} y={height / 2 - 110} text-anchor="middle">click a dot to remove it</text>
+                ] : [
+                    <text x="10" y={height - 10} text-anchor="start"><a onClick={restart}>restart</a></text>
+                ]}
+                <text x={width - 10} y={height - 10} text-anchor="end">
+                    a <a xlinkHref="https://github.com/adamhaile/surplus-demos">surplus demo</a> by <a xlinkHref="https://github.com/adamhaile">adam haile</a>{" "}
+                    - <a xlinkHref="https://github.com/adamhaile/surplus-demos/blob/master/strange.html">view code</a>
+                </text>
+                <circle class="ball" cx={ball().x} cy={ball().y} r="10"></circle>
+                {dots.map(d =>
+                    <circle class={d.p > 0 ? "attractor" : "repulsor"} cx={d.x} cy={d.y} r="5" onClick={removeDot(d)}></circle>
+                )}
+            </svg>
+        </div>
+    ),
+    ctx = canvas.getContext("2d");
+
+// draw trace of ball's location in canvas
+S.on(ball, () => {
+    const b = ball();
+    ctx.strokeStyle = "rgba(60, 60, 60, 0.1)";
+    ctx.beginPath();
+    ctx.moveTo(b.x + 10, b.y);
+    ctx.arc(b.x, b.y, 10, 0,  Math.PI * 2, false);
+    ctx.closePath();
+    ctx.stroke();
+});
+
+document.body.appendChild(view);
+
+// kick it off with first rAF call
+requestAnimationFrame(loop);
+</script>
+
+<script src="http://unpkg.com/surplus-toys"></script>
+<script src="https://unpkg.com/s-array"></script>
